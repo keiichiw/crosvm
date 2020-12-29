@@ -66,7 +66,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
     fn get_features(&mut self) -> Result<u64> {
         println!("get_features {:x}", VIRTIO_FEATURES);
         // dg-- qemu doesn't seem to ack, so assume features are enabled.
-        self.acked_features = VIRTIO_FEATURES;
+        //        self.acked_features = VIRTIO_FEATURES;
         Ok(VIRTIO_FEATURES)
     }
 
@@ -104,6 +104,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         let mut features = VhostUserProtocolFeatures::all();
         features.remove(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS);
         features.remove(VhostUserProtocolFeatures::INFLIGHT_SHMFD);
+        features.remove(VhostUserProtocolFeatures::SLAVE_REQ);
         Ok(features)
     }
 
