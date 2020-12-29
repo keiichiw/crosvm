@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 extern crate vhost;
 
+use std::cmp::{max, min};
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 
 use vmm_vhost::vhost_user::message::*;
 use vmm_vhost::vhost_user::*;
 
+use base::iov_max;
 use data_model::{DataInit, Le16, Le32, Le64};
 
-use devices::virtio::block::virtio_blk_config;
+use devices::virtio::block::{build_config_space, virtio_blk_config};
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
@@ -258,7 +260,8 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if offset >= VHOST_USER_CONFIG_SIZE || size + offset > VHOST_USER_CONFIG_SIZE {
             return Err(Error::InvalidParam);
         }
-        let mut config = virtio_blk_config::default();
+        let seg_max = min(max(iov_max(), 1), u32::max_value() as usize) as u32;
+        let config = build_config_space(1024 * 1024 * 1024, seg_max, 1024);
         println!("get_config OK");
         Ok(config.as_slice()[..size as usize].iter().cloned().collect())
     }

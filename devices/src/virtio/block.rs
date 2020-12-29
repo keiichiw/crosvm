@@ -502,7 +502,7 @@ pub struct Block {
     control_socket: Option<DiskControlResponseSocket>,
 }
 
-fn build_config_space(disk_size: u64, seg_max: u32, block_size: u32) -> virtio_blk_config {
+pub fn build_config_space(disk_size: u64, seg_max: u32, block_size: u32) -> virtio_blk_config {
     virtio_blk_config {
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
         capacity: Le64::from(disk_size >> SECTOR_SHIFT),
