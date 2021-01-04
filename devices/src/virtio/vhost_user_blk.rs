@@ -10,6 +10,7 @@ use vmm_vhost::vhost_user::message::*;
 use vmm_vhost::vhost_user::*;
 
 use base::iov_max;
+use base::{FromRawDescriptor, MemoryMapping, MemoryMappingBuilder, RawDescriptor, SafeDescriptor};
 use data_model::{DataInit, Le16, Le32, Le64};
 
 use devices::virtio::block::{build_config_space, virtio_blk_config};
@@ -33,6 +34,7 @@ pub struct BlockSlaveReqHandler {
     pub vring_started: [bool; MAX_QUEUE_NUM],
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
+    mem_tables: Option<Vec<MemoryMapping>>,
 }
 
 impl BlockSlaveReqHandler {
@@ -122,10 +124,20 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
 
     fn set_mem_table(&mut self, contexts: &[VhostUserMemoryRegion], fds: &[RawFd]) -> Result<()> {
         println!("set_mem_table");
-        for (ctx, fd) in contexts.iter().zip(fds.iter()) {
-            //    let region = MemoryMapping::from_fd_offset(fd, ctx.memory_size, ctx.mmap_offset);
-        }
-        // TODO
+        self.mem_tables = Some(
+            contexts
+                .iter()
+                .zip(fds.iter())
+                .map(|(ctx, &fd)| {
+                    let sd = unsafe { SafeDescriptor::from_raw_descriptor(fd as RawDescriptor) };
+                    MemoryMappingBuilder::new(ctx.memory_size as usize)
+                        .from_descriptor(&sd)
+                        .offset(ctx.mmap_offset)
+                        .build()
+                        .unwrap()
+                })
+                .collect(),
+        );
         Ok(())
     }
 
