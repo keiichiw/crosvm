@@ -14,8 +14,9 @@ use std::sync::Arc;
 use crate::guest_address::GuestAddress;
 use base::{pagesize, Error as SysError};
 use base::{
-    AsRawDescriptor, MappedRegion, MemfdSeals, MemoryMapping, MemoryMappingBuilder,
-    MemoryMappingUnix, MmapError, RawDescriptor, SharedMemory, SharedMemoryUnix,
+    AsRawDescriptor, AsRawDescriptors, MappedRegion, MemfdSeals, MemoryMapping,
+    MemoryMappingBuilder, MemoryMappingUnix, MmapError, RawDescriptor, SharedMemory,
+    SharedMemoryUnix,
 };
 use cros_async::{
     uring_mem::{self, BorrowedIoVec},
@@ -89,6 +90,7 @@ struct MemoryRegion {
     mapping: MemoryMapping,
     guest_base: GuestAddress,
     memfd_offset: u64,
+    memfd: Arc<SharedMemory>,
 }
 
 impl MemoryRegion {
@@ -111,18 +113,20 @@ impl MemoryRegion {
 #[derive(Clone)]
 pub struct GuestMemory {
     regions: Arc<[MemoryRegion]>,
-    memfd: Arc<SharedMemory>,
 }
 
-impl AsRawDescriptor for GuestMemory {
-    fn as_raw_descriptor(&self) -> RawDescriptor {
-        self.memfd.as_raw_descriptor()
+impl AsRawDescriptors for GuestMemory {
+    fn as_raw_descriptors(&self) -> Vec<RawDescriptor> {
+        self.regions
+            .iter()
+            .map(|r| r.memfd.as_raw_descriptor())
+            .collect()
     }
 }
 
 impl AsRef<SharedMemory> for GuestMemory {
     fn as_ref(&self) -> &SharedMemory {
-        &self.memfd
+        &self.regions[0].memfd
     }
 }
 
@@ -159,7 +163,7 @@ impl GuestMemory {
     pub fn new(ranges: &[(GuestAddress, u64)]) -> Result<GuestMemory> {
         // Create memfd
 
-        let memfd = GuestMemory::create_memfd(ranges)?;
+        let memfd = Arc::new(GuestMemory::create_memfd(ranges)?);
         // Create memory regions
         let mut regions = Vec::<MemoryRegion>::new();
         let mut offset = 0;
@@ -178,7 +182,7 @@ impl GuestMemory {
             let size =
                 usize::try_from(range.1).map_err(|_| Error::MemoryRegionTooLarge(range.1))?;
             let mapping = MemoryMappingBuilder::new(size)
-                .from_descriptor(&memfd)
+                .from_descriptor(memfd.as_ref())
                 .offset(offset)
                 .build()
                 .map_err(Error::MemoryMappingFailed)?;
@@ -186,6 +190,7 @@ impl GuestMemory {
                 mapping,
                 guest_base: range.0,
                 memfd_offset: offset,
+                memfd: Arc::clone(&memfd),
             });
 
             offset += size as u64;
@@ -193,7 +198,6 @@ impl GuestMemory {
 
         Ok(GuestMemory {
             regions: Arc::from(regions),
-            memfd: Arc::new(memfd),
         })
     }
 
@@ -637,7 +641,7 @@ impl GuestMemory {
             })
     }
 
-    /// Convert a GuestAddress into an offset within self.memfd.
+    /// Convert a GuestAddress into an offset within the associated memfd.
     ///
     /// Due to potential gaps within GuestMemory, it is helpful to know the
     /// offset within the memfd where a given address is found. This offset
