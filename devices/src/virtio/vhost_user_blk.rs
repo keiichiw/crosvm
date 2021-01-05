@@ -20,6 +20,13 @@ pub const MAX_VRING_NUM: usize = 256;
 pub const VIRTIO_FEATURES: u64 = 0x4000_0003;
 
 #[derive(Default)]
+struct QueueInfo {
+    descriptor_table: u64,
+    avail_ring: u64,
+    used_ring: u64,
+}
+
+#[derive(Default)]
 pub struct BlockSlaveReqHandler {
     pub owned: bool,
     pub features_acked: bool,
@@ -28,6 +35,7 @@ pub struct BlockSlaveReqHandler {
     pub queue_num: usize,
     pub vring_num: [u32; MAX_QUEUE_NUM],
     pub vring_base: [u32; MAX_QUEUE_NUM],
+    queue_info: [QueueInfo; MAX_QUEUE_NUM],
     pub call_fd: [Option<RawFd>; MAX_QUEUE_NUM],
     pub kick_fd: [Option<RawFd>; MAX_QUEUE_NUM],
     pub err_fd: [Option<RawFd>; MAX_QUEUE_NUM],
@@ -43,6 +51,18 @@ impl BlockSlaveReqHandler {
             queue_num: MAX_QUEUE_NUM,
             ..Default::default()
         }
+    }
+
+    fn vmm_va_to_gpa(&self, vmm_va: u64) -> VhostUserHandlerResult<u64> {
+        if let Some(memory) = &self.memory {
+            for mapping in memory.mappings.iter() {
+                if vmm_va >= mapping.vmm_addr && vmm_va < mapping.vmm_addr + mapping.size {
+                    return Ok(vmm_va - mapping.vmm_addr + mapping.gpa_base);
+                }
+            }
+        }
+
+        Err(VhostUserHandlerError::MissingMemoryMapping)
     }
 }
 
@@ -123,7 +143,10 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
     }
 
     fn set_mem_table(&mut self, contexts: &[VhostUserMemoryRegion], fds: &[RawFd]) -> Result<()> {
-        println!("set_mem_table");
+        println!("set_mem_table:");
+        for c in contexts.iter() {
+            println!("    {:x} {:x}", c.memory_size, c.mmap_offset);
+        }
         self.mem_tables = Some(
             contexts
                 .iter()
@@ -158,16 +181,23 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
     fn set_vring_addr(
         &mut self,
         index: u32,
-        _flags: VhostUserVringAddrFlags,
-        _descriptor: u64,
-        _used: u64,
-        _available: u64,
-        _log: u64,
+        flags: VhostUserVringAddrFlags,
+        descriptor: u64,
+        used: u64,
+        available: u64,
+        log: u64,
     ) -> Result<()> {
-        println!("set_vring_addr");
+        println!(
+            "set_vring_addr index:{} flags:{:x} desc:{:x} used:{:x} avail:{:x} log:{:x}",
+            index, flags, descriptor, used, available, log
+        );
         if index as usize >= self.queue_num {
             return Err(Error::InvalidParam);
         }
+        let queue = &mut self.queue_info[index as usize];
+        queue.descriptor_table = self.vmm_va_to_gpa(descriptor);
+        queue.avail_ring = self.vmm_va_to_gpa(available);
+        queue.used_ring = self.vmm_va_to_gpa(used);
         Ok(())
     }
 
