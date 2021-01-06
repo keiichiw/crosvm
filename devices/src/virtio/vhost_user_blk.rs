@@ -25,9 +25,9 @@ pub const VIRTIO_FEATURES: u64 = 0x4000_0003;
 
 #[derive(Default)]
 struct QueueInfo {
-    descriptor_table: u64,
-    avail_ring: u64,
-    used_ring: u64,
+    descriptor_table: GuestAddress,
+    avail_ring: GuestAddress,
+    used_ring: GuestAddress,
 }
 
 /// Keeps a mpaaing from the vmm's virtual addresses to guest addresses.
@@ -64,7 +64,7 @@ pub struct BlockSlaveReqHandler {
     pub vring_base: [u32; MAX_QUEUE_NUM],
     queue_info: [QueueInfo; MAX_QUEUE_NUM],
     pub call_fd: [Option<RawFd>; MAX_QUEUE_NUM],
-    pub kick_fd: [Option<RawFd>; MAX_QUEUE_NUM],
+    pub kick_fd: [Option<EventFd>; MAX_QUEUE_NUM],
     pub err_fd: [Option<RawFd>; MAX_QUEUE_NUM],
     pub vring_started: [bool; MAX_QUEUE_NUM],
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
@@ -230,9 +230,12 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         }
         let queue = &mut self.queue_info[index as usize];
         if let Some(mem) = &self.mem {
-            queue.descriptor_table = vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap();
-            queue.avail_ring = vmm_va_to_gpa(&mem.vmm_maps, available).unwrap();
-            queue.used_ring = vmm_va_to_gpa(&mem.vmm_maps, used).unwrap();
+            queue.descriptor_table =
+                GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap());
+            queue.avail_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, available).unwrap());
+            queue.used_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, used).unwrap());
+        } else {
+            return Err(Error::InvalidParam);
         }
         Ok(())
     }
@@ -268,11 +271,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if index as usize >= self.queue_num || index as usize > self.queue_num {
             return Err(Error::InvalidParam);
         }
-        if self.kick_fd[index as usize].is_some() {
-            // Close file descriptor set by previous operations.
-            let _ = unsafe { libc::close(self.kick_fd[index as usize].unwrap()) };
-        }
-        self.kick_fd[index as usize] = fd;
+        self.kick_fd[index as usize] = fd.map(EventFd::from);
 
         // Quotation from vhost-user spec:
         // Client must start ring upon receiving a kick (that is, detecting
@@ -282,6 +281,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         //
         // So we should add fd to event monitor(select, poll, epoll) here.
         self.vring_started[index as usize] = true;
+        // TODO:dgreid - call activate here.
         Ok(())
     }
 
