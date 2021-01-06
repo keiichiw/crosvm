@@ -10,8 +10,12 @@ use vmm_vhost::vhost_user::message::*;
 use vmm_vhost::vhost_user::*;
 
 use base::iov_max;
-use base::{FromRawDescriptor, MemoryMapping, MemoryMappingBuilder, RawDescriptor, SafeDescriptor};
+use base::{
+    FromRawDescriptor, MemoryMapping, MemoryMappingBuilder, RawDescriptor, SafeDescriptor,
+    SharedMemory, SharedMemoryUnix,
+};
 use data_model::{DataInit, Le16, Le32, Le64};
+use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
 use devices::virtio::block::{build_config_space, virtio_blk_config};
 
@@ -24,6 +28,29 @@ struct QueueInfo {
     descriptor_table: u64,
     avail_ring: u64,
     used_ring: u64,
+}
+
+/// Keeps a mpaaing from the vmm's virtual addresses to guest addresses.
+/// used to translate messages from the vmm to guest offsets.
+#[derive(Default)]
+struct MappingInfo {
+    vmm_addr: u64,
+    guest_phys: u64,
+    size: u64,
+}
+
+fn vmm_va_to_gpa(maps: &Vec<MappingInfo>, vmm_va: u64) -> Result<u64> {
+    for map in maps {
+        if vmm_va >= map.vmm_addr && vmm_va < map.vmm_addr + map.size {
+            return Ok(vmm_va - map.vmm_addr + map.guest_phys);
+        }
+    }
+    Err(Error::InvalidMessage)
+}
+
+struct MemInfo {
+    guest_mem: GuestMemory,
+    vmm_maps: Vec<MappingInfo>,
 }
 
 #[derive(Default)]
@@ -42,7 +69,7 @@ pub struct BlockSlaveReqHandler {
     pub vring_started: [bool; MAX_QUEUE_NUM],
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
-    mem_tables: Option<Vec<MemoryMapping>>,
+    mem: Option<MemInfo>,
 }
 
 impl BlockSlaveReqHandler {
@@ -51,18 +78,6 @@ impl BlockSlaveReqHandler {
             queue_num: MAX_QUEUE_NUM,
             ..Default::default()
         }
-    }
-
-    fn vmm_va_to_gpa(&self, vmm_va: u64) -> VhostUserHandlerResult<u64> {
-        if let Some(memory) = &self.memory {
-            for mapping in memory.mappings.iter() {
-                if vmm_va >= mapping.vmm_addr && vmm_va < mapping.vmm_addr + mapping.size {
-                    return Ok(vmm_va - mapping.vmm_addr + mapping.gpa_base);
-                }
-            }
-        }
-
-        Err(VhostUserHandlerError::MissingMemoryMapping)
     }
 }
 
@@ -147,20 +162,39 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         for c in contexts.iter() {
             println!("    {:x} {:x}", c.memory_size, c.mmap_offset);
         }
-        self.mem_tables = Some(
-            contexts
-                .iter()
-                .zip(fds.iter())
-                .map(|(ctx, &fd)| {
-                    let sd = unsafe { SafeDescriptor::from_raw_descriptor(fd as RawDescriptor) };
-                    MemoryMappingBuilder::new(ctx.memory_size as usize)
-                        .from_descriptor(&sd)
-                        .offset(ctx.mmap_offset)
-                        .build()
-                        .unwrap()
-                })
-                .collect(),
-        );
+        if fds.len() != contexts.len() {
+            println!("set_mem_table: mismatched fd/context count.");
+            return Err(Error::InvalidParam);
+        }
+
+        let regions = contexts
+            .iter()
+            .zip(fds.iter())
+            .map(|(region, &fd)| {
+                let sd = unsafe { SafeDescriptor::from_raw_descriptor(fd as RawDescriptor) };
+                MemoryRegion::new(
+                    region.memory_size,
+                    GuestAddress(region.guest_phys_addr),
+                    region.mmap_offset,
+                    Arc::new(SharedMemory::from_safe_descriptor(sd).unwrap()),
+                )
+                .unwrap()
+            })
+            .collect();
+        let guest_mem = GuestMemory::from_regions(regions).unwrap();
+
+        let vmm_maps = contexts
+            .iter()
+            .map(|region| MappingInfo {
+                vmm_addr: region.user_addr,
+                guest_phys: region.guest_phys_addr,
+                size: region.memory_size,
+            })
+            .collect();
+        self.mem = Some(MemInfo {
+            guest_mem,
+            vmm_maps,
+        });
         Ok(())
     }
 
@@ -195,9 +229,11 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
             return Err(Error::InvalidParam);
         }
         let queue = &mut self.queue_info[index as usize];
-        queue.descriptor_table = self.vmm_va_to_gpa(descriptor);
-        queue.avail_ring = self.vmm_va_to_gpa(available);
-        queue.used_ring = self.vmm_va_to_gpa(used);
+        if let Some(mem) = &self.mem {
+            queue.descriptor_table = vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap();
+            queue.avail_ring = vmm_va_to_gpa(&mem.vmm_maps, available).unwrap();
+            queue.used_ring = vmm_va_to_gpa(&mem.vmm_maps, used).unwrap();
+        }
         Ok(())
     }
 
