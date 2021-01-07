@@ -11,7 +11,7 @@ use vmm_vhost::vhost_user::*;
 
 use base::iov_max;
 use base::{
-    FromRawDescriptor, MemoryMapping, MemoryMappingBuilder, RawDescriptor, SafeDescriptor,
+    Event, FromRawDescriptor, MemoryMapping, MemoryMappingBuilder, RawDescriptor, SafeDescriptor,
     SharedMemory, SharedMemoryUnix,
 };
 use data_model::{DataInit, Le16, Le32, Le64};
@@ -23,7 +23,6 @@ pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
 pub const VIRTIO_FEATURES: u64 = 0x4000_0003;
 
-#[derive(Default)]
 struct QueueInfo {
     descriptor_table: GuestAddress,
     avail_ring: GuestAddress,
@@ -62,10 +61,10 @@ pub struct BlockSlaveReqHandler {
     pub queue_num: usize,
     pub vring_num: [u32; MAX_QUEUE_NUM],
     pub vring_base: [u32; MAX_QUEUE_NUM],
-    queue_info: [QueueInfo; MAX_QUEUE_NUM],
-    pub call_fd: [Option<RawFd>; MAX_QUEUE_NUM],
-    pub kick_fd: [Option<EventFd>; MAX_QUEUE_NUM],
-    pub err_fd: [Option<RawFd>; MAX_QUEUE_NUM],
+    queue_info: [Option<QueueInfo>; MAX_QUEUE_NUM],
+    pub call_fd: [Option<Event>; MAX_QUEUE_NUM],
+    pub kick_fd: [Option<Event>; MAX_QUEUE_NUM],
+    pub err_fd: [Option<Event>; MAX_QUEUE_NUM],
     pub vring_started: [bool; MAX_QUEUE_NUM],
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
@@ -229,14 +228,16 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
             return Err(Error::InvalidParam);
         }
         let queue = &mut self.queue_info[index as usize];
-        if let Some(mem) = &self.mem {
-            queue.descriptor_table =
-                GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap());
-            queue.avail_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, available).unwrap());
-            queue.used_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, used).unwrap());
-        } else {
-            return Err(Error::InvalidParam);
+        if let Some(queue) = queue {
+            if let Some(mem) = &self.mem {
+                queue.descriptor_table =
+                    GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap());
+                queue.avail_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, available).unwrap());
+                queue.used_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, used).unwrap());
+                return Ok(());
+            }
         }
+        return Err(Error::InvalidParam);
         Ok(())
     }
 
@@ -271,7 +272,10 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if index as usize >= self.queue_num || index as usize > self.queue_num {
             return Err(Error::InvalidParam);
         }
-        self.kick_fd[index as usize] = fd.map(EventFd::from);
+        unsafe {
+            // Safe because the FD is now owned.
+            self.kick_fd[index as usize] = fd.map(|fd| Event::from_raw_descriptor(fd));
+        }
 
         // Quotation from vhost-user spec:
         // Client must start ring upon receiving a kick (that is, detecting
@@ -281,7 +285,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         //
         // So we should add fd to event monitor(select, poll, epoll) here.
         self.vring_started[index as usize] = true;
-        // TODO:dgreid - call activate here.
+        // TODO:dgreid - call activate here? or wait until both kick,call,and err have been set?
         Ok(())
     }
 
@@ -290,11 +294,10 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if index as usize >= self.queue_num || index as usize > self.queue_num {
             return Err(Error::InvalidParam);
         }
-        if self.call_fd[index as usize].is_some() {
-            // Close file descriptor set by previous operations.
-            let _ = unsafe { libc::close(self.call_fd[index as usize].unwrap()) };
+        unsafe {
+            // Safe because the FD is now owned.
+            self.call_fd[index as usize] = fd.map(|fd| Event::from_raw_descriptor(fd));
         }
-        self.call_fd[index as usize] = fd;
         Ok(())
     }
 
@@ -303,11 +306,10 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if index as usize >= self.queue_num || index as usize > self.queue_num {
             return Err(Error::InvalidParam);
         }
-        if self.err_fd[index as usize].is_some() {
-            // Close file descriptor set by previous operations.
-            let _ = unsafe { libc::close(self.err_fd[index as usize].unwrap()) };
+        unsafe {
+            // Safe because the FD is now owned.
+            self.err_fd[index as usize] = fd.map(|fd| Event::from_raw_descriptor(fd));
         }
-        self.err_fd[index as usize] = fd;
         Ok(())
     }
 
