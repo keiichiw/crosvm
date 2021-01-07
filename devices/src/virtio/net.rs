@@ -23,7 +23,8 @@ use virtio_sys::virtio_net::{
 use vm_memory::GuestMemory;
 
 use super::{
-    copy_config, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer, TYPE_NET,
+    copy_config, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt, VirtioDevice,
+    Writer, TYPE_NET,
 };
 
 const QUEUE_SIZE: u16 = 256;

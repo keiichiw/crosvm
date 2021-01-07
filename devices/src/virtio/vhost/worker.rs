@@ -9,7 +9,7 @@ use vhost::Vhost;
 
 use super::control_socket::{VhostDevRequest, VhostDevResponse, VhostDevResponseSocket};
 use super::{Error, Result};
-use crate::virtio::{Interrupt, Queue};
+use crate::virtio::{Interrupt, Queue, SignalableInterrupt};
 use libc::EIO;
 use msg_socket::{MsgReceiver, MsgSender};
 

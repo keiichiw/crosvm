@@ -33,8 +33,8 @@ use vm_control::{DiskControlCommand, DiskControlResponseSocket, DiskControlResul
 use vm_memory::GuestMemory;
 
 use super::{
-    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer,
-    TYPE_BLOCK,
+    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt,
+    VirtioDevice, Writer, TYPE_BLOCK,
 };
 
 const QUEUE_SIZE: u16 = 256;
@@ -352,7 +352,7 @@ async fn process_one_request_task(
 
     let mut queue = queue.borrow_mut();
     queue.add_used(&mem, descriptor_index, len as u32);
-    queue.trigger_interrupt(&mem, &interrupt.borrow());
+    queue.trigger_interrupt(&mem, &*interrupt.borrow());
     queue.update_int_required(&mem);
 }
 

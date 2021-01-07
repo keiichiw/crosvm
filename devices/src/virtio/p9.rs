@@ -12,7 +12,8 @@ use base::{error, warn, Error as SysError, Event, PollToken, RawDescriptor, Wait
 use vm_memory::GuestMemory;
 
 use super::{
-    copy_config, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer, TYPE_9P,
+    copy_config, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt, VirtioDevice,
+    Writer, TYPE_9P,
 };
 
 const QUEUE_SIZE: u16 = 128;

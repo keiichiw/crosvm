@@ -22,8 +22,8 @@ use vm_control::{
 use vm_memory::{GuestAddress, GuestMemory};
 
 use super::{
-    copy_config, descriptor_utils, DescriptorChain, Interrupt, Queue, Reader, VirtioDevice,
-    TYPE_BALLOON,
+    copy_config, descriptor_utils, DescriptorChain, Interrupt, Queue, Reader, SignalableInterrupt,
+    VirtioDevice, TYPE_BALLOON,
 };
 
 #[derive(Debug)]

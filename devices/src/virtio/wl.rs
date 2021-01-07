@@ -70,7 +70,9 @@ use vm_memory::{GuestMemory, GuestMemoryError};
 use base::ioctl_with_ref;
 
 use super::resource_bridge::*;
-use super::{DescriptorChain, Interrupt, Queue, Reader, VirtioDevice, Writer, TYPE_WL};
+use super::{
+    DescriptorChain, Interrupt, Queue, Reader, SignalableInterrupt, VirtioDevice, Writer, TYPE_WL,
+};
 use vm_control::{
     MaybeOwnedDescriptor, MemSlot, VmMemoryControlRequestSocket, VmMemoryRequest, VmMemoryResponse,
 };

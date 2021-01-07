@@ -15,7 +15,7 @@ use vm_control::{FsMappingRequest, FsMappingRequestSocket, MaybeOwnedDescriptor,
 use vm_memory::GuestMemory;
 
 use crate::virtio::fs::{Error, Result};
-use crate::virtio::{Interrupt, Queue, Reader, Writer};
+use crate::virtio::{Interrupt, Queue, Reader, SignalableInterrupt, Writer};
 
 impl fuse::Reader for Reader {}
 

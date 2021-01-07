@@ -10,7 +10,7 @@ use std::thread;
 use base::{error, warn, AsRawDescriptor, Event, PollToken, RawDescriptor, WaitContext};
 use vm_memory::GuestMemory;
 
-use super::{Interrupt, Queue, VirtioDevice, Writer, TYPE_RNG};
+use super::{Interrupt, Queue, SignalableInterrupt, VirtioDevice, Writer, TYPE_RNG};
 
 const QUEUE_SIZE: u16 = 256;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];

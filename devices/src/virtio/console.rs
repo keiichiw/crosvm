@@ -11,7 +11,8 @@ use data_model::{DataInit, Le16, Le32};
 use vm_memory::GuestMemory;
 
 use super::{
-    base_features, copy_config, Interrupt, Queue, Reader, VirtioDevice, Writer, TYPE_CONSOLE,
+    base_features, copy_config, Interrupt, Queue, Reader, SignalableInterrupt, VirtioDevice,
+    Writer, TYPE_CONSOLE,
 };
 use crate::SerialDevice;
 

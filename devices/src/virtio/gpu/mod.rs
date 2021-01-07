@@ -42,8 +42,8 @@ use sync::Mutex;
 use vm_memory::{GuestAddress, GuestMemory};
 
 use super::{
-    copy_config, resource_bridge::*, DescriptorChain, Interrupt, Queue, Reader, VirtioDevice,
-    Writer, TYPE_GPU,
+    copy_config, resource_bridge::*, DescriptorChain, Interrupt, Queue, Reader,
+    SignalableInterrupt, VirtioDevice, Writer, TYPE_GPU,
 };
 
 use super::{PciCapabilityType, VirtioPciShmCap};

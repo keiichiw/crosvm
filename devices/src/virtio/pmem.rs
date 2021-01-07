@@ -18,8 +18,8 @@ use msg_socket::{MsgReceiver, MsgSender};
 use vm_control::{MemSlot, VmMsyncRequest, VmMsyncRequestSocket, VmMsyncResponse};
 
 use super::{
-    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer,
-    TYPE_PMEM,
+    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt,
+    VirtioDevice, Writer, TYPE_PMEM,
 };
 
 const QUEUE_SIZE: u16 = 256;
