@@ -18,8 +18,8 @@ use msg_socket::{MsgReceiver, MsgSender};
 use vm_control::{MemSlot, VmMsyncRequest, VmMsyncRequestSocket, VmMsyncResponse};
 
 use super::{
-    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer,
-    TYPE_PMEM,
+    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt,
+    VirtioDevice, Writer, TYPE_PMEM,
 };
 
 const QUEUE_SIZE: u16 = 256;
@@ -177,7 +177,6 @@ impl Worker {
 
         let wait_ctx: WaitContext<Token> = match WaitContext::build_with(&[
             (&queue_evt, Token::QueueAvailable),
-            (self.interrupt.get_resample_evt(), Token::InterruptResample),
             (&kill_evt, Token::Kill),
         ]) {
             Ok(pc) => pc,
@@ -186,6 +185,15 @@ impl Worker {
                 return;
             }
         };
+        if let Some(resample_evt) = self.interrupt.get_resample_evt() {
+            if wait_ctx
+                .add(resample_evt, Token::InterruptResample)
+                .is_err()
+            {
+                error!("failed adding resample event to WaitContext.");
+                return;
+            }
+        }
 
         'wait: loop {
             let events = match wait_ctx.wait() {
