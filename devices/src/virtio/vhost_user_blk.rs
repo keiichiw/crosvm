@@ -3,6 +3,7 @@
 extern crate vhost;
 
 use std::cmp::{max, min};
+use std::fs::OpenOptions;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +18,7 @@ use base::{
 use data_model::{DataInit, Le16, Le32, Le64};
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
+use device::virtio::Interrupt;
 use devices::virtio::block::{build_config_space, virtio_blk_config};
 
 pub const MAX_QUEUE_NUM: usize = 2;
@@ -77,6 +79,16 @@ impl BlockSlaveReqHandler {
             queue_num: MAX_QUEUE_NUM,
             ..Default::default()
         }
+    }
+
+    fn start_block_dev(&self) {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open("/tmp/blk.img")
+            .unwrap();
+        AsyncBlock::new(base_features(), f).map()
     }
 }
 
