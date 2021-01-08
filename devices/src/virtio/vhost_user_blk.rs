@@ -18,8 +18,9 @@ use base::{
 use data_model::{DataInit, Le16, Le32, Le64};
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
-use device::virtio::Interrupt;
 use devices::virtio::block::{build_config_space, virtio_blk_config};
+use devices::virtio::Interrupt;
+use devices::virtio::{base_features, BlockAsync};
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
@@ -71,6 +72,7 @@ pub struct BlockSlaveReqHandler {
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
     mem: Option<MemInfo>,
+    block: Option<BlockAsync>,
 }
 
 impl BlockSlaveReqHandler {
@@ -81,14 +83,24 @@ impl BlockSlaveReqHandler {
         }
     }
 
-    fn start_block_dev(&self) {
+    fn start_block_dev(&mut self) {
+        self.block = None;
         let f = OpenOptions::new()
             .read(true)
             .write(true)
             .create(false)
             .open("/tmp/blk.img")
             .unwrap();
-        AsyncBlock::new(base_features(), f).map()
+        let block = BlockAsync::new(
+            base_features(false /*protected vm*/),
+            Box::new(f),
+            false, /*read-only*/
+            false, /*sparse*/
+            512,
+            None,
+        )
+        .unwrap();
+        self.block = Some(block);
     }
 }
 
