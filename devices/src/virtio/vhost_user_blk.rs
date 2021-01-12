@@ -5,6 +5,7 @@ extern crate vhost;
 use std::cmp::{max, min};
 use std::fs::OpenOptions;
 use std::os::unix::io::RawFd;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use vmm_vhost::vhost_user::message::*;
@@ -72,7 +73,6 @@ struct MemInfo {
     vmm_maps: Vec<MappingInfo>,
 }
 
-#[derive(Default)]
 pub struct BlockSlaveReqHandler {
     pub owned: bool,
     pub features_acked: bool,
@@ -89,14 +89,43 @@ pub struct BlockSlaveReqHandler {
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
     mem: Option<MemInfo>,
-    block: Option<BlockAsync>,
+    block: BlockAsync,
 }
 
 impl BlockSlaveReqHandler {
-    pub fn new() -> Self {
+    pub fn new<P: AsRef<Path>>(filename: P) -> Self {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open(filename)
+            .unwrap();
+        let mut block = BlockAsync::new(
+            base_features(false /*protected vm*/),
+            Box::new(f),
+            false, /*read-only*/
+            false, /*sparse*/
+            512,
+            None,
+        )
+        .unwrap();
         BlockSlaveReqHandler {
+            owned: false,
+            features_acked: false,
+            acked_features: 0,
+            acked_protocol_features: 0,
             queue_num: MAX_QUEUE_NUM,
-            ..Default::default()
+            vring_num: [0; MAX_QUEUE_NUM],
+            vring_base: [0; MAX_QUEUE_NUM],
+            queue_info: Default::default(),
+            call_fd: Default::default(),
+            kick_fd: Default::default(),
+            err_fd: Default::default(),
+            vring_started: [false; MAX_QUEUE_NUM],
+            vring_enabled: [false; MAX_QUEUE_NUM],
+            vu_req: None,
+            mem: None,
+            block,
         }
     }
 
@@ -127,22 +156,6 @@ impl BlockSlaveReqHandler {
     }
 
     fn start_block_dev(&mut self) {
-        self.block = None;
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(false)
-            .open("/tmp/blk.img")
-            .unwrap();
-        let mut block = BlockAsync::new(
-            base_features(false /*protected vm*/),
-            Box::new(f),
-            false, /*read-only*/
-            false, /*sparse*/
-            512,
-            None,
-        )
-        .unwrap();
         let call_events = self
             .call_fd
             .iter_mut()
@@ -171,13 +184,13 @@ impl BlockSlaveReqHandler {
             .filter(|o| o.is_some())
             .map(|event| event.take().unwrap())
             .collect();
-        block.activate_vhost(
+        self.block.reset();
+        self.block.activate_vhost(
             self.mem.as_ref().unwrap().guest_mem.clone(),
             call_events,
             queues,
             eventfds,
         );
-        self.block = Some(block);
     }
 }
 
@@ -329,7 +342,6 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if index as usize >= self.queue_num {
             return Err(Error::InvalidParam);
         }
-        let queue = &mut self.queue_info[index as usize];
         if let Some(mem) = &self.mem {
             let queue = QueueInfo {
                 desc_table: GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap()),
@@ -455,10 +467,9 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if offset >= VHOST_USER_CONFIG_SIZE || size + offset > VHOST_USER_CONFIG_SIZE {
             return Err(Error::InvalidParam);
         }
-        let seg_max = min(max(iov_max(), 1), u32::max_value() as usize) as u32;
-        let config = build_config_space(1024 * 1024 * 1024, seg_max, 1024);
-        println!("get_config OK");
-        Ok(config.as_slice()[..size as usize].iter().cloned().collect())
+        let mut data = vec![0; size as usize];
+        self.block.read_config(u64::from(offset), &mut data);
+        Ok(data)
     }
 
     fn set_config(&mut self, offset: u32, buf: &[u8], _flags: VhostUserConfigFlags) -> Result<()> {
@@ -480,7 +491,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
 }
 
 fn main() -> Result<()> {
-    let backend = Arc::new(Mutex::new(BlockSlaveReqHandler::new()));
+    let backend = Arc::new(Mutex::new(BlockSlaveReqHandler::new("/tmp/blk.img")));
     let listener = Listener::new("/tmp/vhost_user_blk.socket", true).unwrap();
     let mut slave_listener = SlaveListener::new(listener, backend).unwrap();
     let mut listener = slave_listener.accept().unwrap().unwrap();
