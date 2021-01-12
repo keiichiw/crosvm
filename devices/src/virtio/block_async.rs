@@ -368,7 +368,6 @@ async fn handle_queue(
     interrupt: Box<dyn SignalableInterrupt + Send>,
     flush_timer_armed: Rc<AtomicBool>,
 ) {
-    println!("handle queue start");
     let interrupt = Rc::new(RefCell::new(interrupt));
     loop {
         let descriptor_chain = queue.borrow_mut().pop(&mem);
@@ -382,7 +381,6 @@ async fn handle_queue(
             },
             Some(d) => d,
         };
-        println!("got a kick");
 
         if let Err(e) = cros_async::add_future(Box::pin(process_one_request_task(
             Rc::clone(&queue),
@@ -533,12 +531,6 @@ fn run_worker(
     let flush_timer_armed = Rc::new(AtomicBool::new(false));
 
     // Handle all the queues in one sub-select call.
-    println!(
-        "run worker spawn queues {} {} {}",
-        queues.len(),
-        queue_evts.len(),
-        interrupts.len()
-    );
     let queue_handlers =
         queues
             .into_iter()
@@ -552,7 +544,6 @@ fn run_worker(
                 // alias some refs so the lifetimes work.
                 let mem = &mem;
                 let disk_state = &disk_state;
-                println!("create handle queue box");
                 Box::pin(handle_queue(
                     mem,
                     Rc::clone(disk_state),
@@ -578,7 +569,6 @@ fn run_worker(
     pin_mut!(kill);
 
     // And return once any future exits.
-    println!("wait select2");
     let _ = select2(queue_handlers, /*control, resample,*/ kill);
 
     Ok(())
@@ -897,7 +887,6 @@ impl VirtioDevice for BlockAsync {
         queues: Vec<Queue>,
         queue_evts: Vec<Event>,
     ) {
-        println!("activate vhost");
         let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(e) => {
@@ -910,9 +899,7 @@ impl VirtioDevice for BlockAsync {
         let read_only = self.read_only;
         let sparse = self.sparse;
         let disk_size = self.disk_size.clone();
-        println!("activate vhost check disk");
         if let Some(disk_image) = self.disk_image.take() {
-            println!("activate vhost has disk");
             let control_socket = self.control_socket.take();
             let worker_result =
                 thread::Builder::new()
