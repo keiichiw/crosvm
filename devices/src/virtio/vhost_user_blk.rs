@@ -19,15 +19,32 @@ use data_model::{DataInit, Le16, Le32, Le64};
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
 use devices::virtio::block::{build_config_space, virtio_blk_config};
-use devices::virtio::Interrupt;
-use devices::virtio::{base_features, BlockAsync};
+use devices::virtio::SignalableInterrupt;
+use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
 pub const VIRTIO_FEATURES: u64 = 0x4000_0003;
 
+struct CallEvent(Event);
+
+impl SignalableInterrupt for CallEvent {
+    /// Writes to the irqfd to VMM to deliver virtual interrupt to the guest.
+    fn signal(&self, vector: u16, interrupt_status_mask: u32) {
+        self.0.write(interrupt_status_mask as u64).unwrap();
+    }
+
+    /// Notify the driver that buffers have been placed in the used queue.
+    fn signal_used_queue(&self, vector: u16) {
+        self.signal(vector, 0 /*INTERRUPT_STATUS_USED_RING*/)
+    }
+
+    /// Notify the driver that the device configuration has changed.
+    fn signal_config_changed(&self) {} // TODO(dgreid)
+}
+
 struct QueueInfo {
-    descriptor_table: GuestAddress,
+    desc_table: GuestAddress,
     avail_ring: GuestAddress,
     used_ring: GuestAddress,
 }
@@ -83,6 +100,32 @@ impl BlockSlaveReqHandler {
         }
     }
 
+    fn potentially_start_dev(&mut self) {
+        let num_queues = self.queue_info.iter().filter(|o| o.is_some()).count();
+        if num_queues < 1 {
+            println!("no queue info {} {}", num_queues, self.queue_num);
+            return;
+        }
+        if self.kick_fd.iter().filter(|o| o.is_some()).count() < num_queues {
+            println!(
+                "no kicks {} {}",
+                self.kick_fd.iter().filter(|o| o.is_some()).count(),
+                self.queue_num
+            );
+            return;
+        }
+        if self.call_fd.iter().filter(|o| o.is_some()).count() < num_queues {
+            println!(
+                "no call {} {}",
+                self.call_fd.iter().filter(|o| o.is_some()).count(),
+                self.queue_num
+            );
+            return;
+        }
+        println!("-------- start dev");
+        self.start_block_dev();
+    }
+
     fn start_block_dev(&mut self) {
         self.block = None;
         let f = OpenOptions::new()
@@ -91,7 +134,7 @@ impl BlockSlaveReqHandler {
             .create(false)
             .open("/tmp/blk.img")
             .unwrap();
-        let block = BlockAsync::new(
+        let mut block = BlockAsync::new(
             base_features(false /*protected vm*/),
             Box::new(f),
             false, /*read-only*/
@@ -100,6 +143,40 @@ impl BlockSlaveReqHandler {
             None,
         )
         .unwrap();
+        let call_events = self
+            .call_fd
+            .iter_mut()
+            .filter(|o| o.is_some())
+            .map(|io| Box::<CallEvent>::new(CallEvent(io.take().unwrap())))
+            .map(|b| Box::<dyn SignalableInterrupt + Send>::from(b))
+            .collect();
+        let queues = self
+            .queue_info
+            .iter()
+            .filter(|o| o.is_some())
+            .zip(self.vring_num.iter())
+            .map(|(o, n)| {
+                let qi = o.as_ref().unwrap();
+                let mut queue = Queue::new(*n as u16);
+                queue.desc_table = qi.desc_table;
+                queue.avail_ring = qi.avail_ring;
+                queue.used_ring = qi.used_ring;
+                queue.ready = true;
+                queue
+            })
+            .collect();
+        let eventfds = self
+            .kick_fd
+            .iter_mut()
+            .filter(|o| o.is_some())
+            .map(|event| event.take().unwrap())
+            .collect();
+        block.activate_vhost(
+            self.mem.as_ref().unwrap().guest_mem.clone(),
+            call_events,
+            queues,
+            eventfds,
+        );
         self.block = Some(block);
     }
 }
@@ -232,6 +309,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
             return Err(Error::InvalidParam);
         }
         self.vring_num[index as usize] = num;
+
         Ok(())
     }
 
@@ -252,14 +330,14 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
             return Err(Error::InvalidParam);
         }
         let queue = &mut self.queue_info[index as usize];
-        if let Some(queue) = queue {
-            if let Some(mem) = &self.mem {
-                queue.descriptor_table =
-                    GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap());
-                queue.avail_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, available).unwrap());
-                queue.used_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, used).unwrap());
-                return Ok(());
-            }
+        if let Some(mem) = &self.mem {
+            let queue = QueueInfo {
+                desc_table: GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap()),
+                avail_ring: GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, available).unwrap()),
+                used_ring: GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, used).unwrap()),
+            };
+            self.queue_info[index as usize] = Some(queue);
+            return Ok(());
         }
         return Err(Error::InvalidParam);
         Ok(())
@@ -285,6 +363,15 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         // VHOST_USER_SET_VRING_KICK, and stop ring upon receiving
         // VHOST_USER_GET_VRING_BASE.
         self.vring_started[index as usize] = false;
+        for c in self.call_fd.iter_mut() {
+            *c = None;
+        }
+        for c in self.kick_fd.iter_mut() {
+            *c = None;
+        }
+        for c in self.queue_info.iter_mut() {
+            *c = None;
+        }
         Ok(VhostUserVringState::new(
             index,
             self.vring_base[index as usize],
@@ -310,11 +397,12 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         // So we should add fd to event monitor(select, poll, epoll) here.
         self.vring_started[index as usize] = true;
         // TODO:dgreid - call activate here? or wait until both kick,call,and err have been set?
+        self.potentially_start_dev();
         Ok(())
     }
 
     fn set_vring_call(&mut self, index: u8, fd: Option<RawFd>) -> Result<()> {
-        println!("set_vring_call");
+        println!("set_vring_call {}", index);
         if index as usize >= self.queue_num || index as usize > self.queue_num {
             return Err(Error::InvalidParam);
         }
@@ -322,6 +410,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
             // Safe because the FD is now owned.
             self.call_fd[index as usize] = fd.map(|fd| Event::from_raw_descriptor(fd));
         }
+        self.potentially_start_dev();
         Ok(())
     }
 
@@ -352,6 +441,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         // or after it has been disabled by VHOST_USER_SET_VRING_ENABLE
         // with parameter 0.
         self.vring_enabled[index as usize] = enable;
+        self.potentially_start_dev();
         Ok(())
     }
 

@@ -21,6 +21,16 @@ pub trait SignalableInterrupt {
     /// Notify the driver that the device configuration has changed.
     fn signal_config_changed(&self);
 }
+/*
+impl<T: SignalableInterrupt> SignalableInterrupt for Box<T> {
+    fn signal(&self, vector: u16, interrupt_status_mask: u32) {
+        *self.signal(vector, interrupt_status_mask)
+    }
+
+    fn signal_config_changed(&self) {
+        *self.signal_config_changed()
+    }
+}*/
 
 pub struct Interrupt {
     interrupt_status: Arc<AtomicUsize>,

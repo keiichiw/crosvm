@@ -25,7 +25,7 @@ use libchromeos::sync::Mutex as AsyncMutex;
 use base::Error as SysError;
 use base::Result as SysResult;
 use base::{error, info, iov_max, warn, AsRawDescriptor, Event, RawDescriptor, Timer};
-use cros_async::{select4, AsyncError, EventAsync, TimerAsync};
+use cros_async::{select2, AsyncError, EventAsync, TimerAsync};
 use data_model::{DataInit, Le16, Le32, Le64};
 use disk::{AsyncDisk, ToAsyncDisk};
 use msg_socket::{MsgError, MsgSender};
@@ -335,7 +335,7 @@ async fn process_one_request_task(
     avail_desc: DescriptorChain,
     disk_state: Rc<RefCell<DiskState>>,
     mem: GuestMemory,
-    interrupt: Rc<RefCell<Interrupt>>,
+    interrupt: Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>,
     flush_timer_armed: Rc<AtomicBool>,
 ) {
     let descriptor_index = avail_desc.index;
@@ -352,7 +352,8 @@ async fn process_one_request_task(
 
     let mut queue = queue.borrow_mut();
     queue.add_used(&mem, descriptor_index, len as u32);
-    queue.trigger_interrupt(&mem, &*interrupt.borrow());
+    //let int: &dyn SignalableInterrupt +'static= &*interrupt.borrow();
+    queue.trigger_interrupt(&mem, (&*interrupt.borrow()).as_ref());
     queue.update_int_required(&mem);
 }
 
@@ -364,9 +365,11 @@ async fn handle_queue(
     disk_state: Rc<RefCell<DiskState>>,
     queue: Rc<RefCell<Queue>>,
     evt: EventAsync,
-    interrupt: Rc<RefCell<Interrupt>>,
+    interrupt: Box<dyn SignalableInterrupt + Send>,
     flush_timer_armed: Rc<AtomicBool>,
 ) {
+    println!("handle queue start");
+    let interrupt = Rc::new(RefCell::new(interrupt));
     loop {
         let descriptor_chain = queue.borrow_mut().pop(&mem);
         let descriptor_chain = match descriptor_chain {
@@ -379,6 +382,7 @@ async fn handle_queue(
             },
             Some(d) => d,
         };
+        println!("got a kick");
 
         if let Err(e) = cros_async::add_future(Box::pin(process_one_request_task(
             Rc::clone(&queue),
@@ -422,6 +426,7 @@ async fn flush_timer(disk_state: Rc<RefCell<DiskState>>) -> result::Result<(), O
         .map_err(OtherError::FsyncDisk)
 }
 
+/*
 async fn handle_irq_resample(interrupt: Rc<RefCell<Interrupt>>) -> result::Result<(), OtherError> {
     let resample_evt = interrupt
         .borrow_mut()
@@ -438,6 +443,7 @@ async fn handle_irq_resample(interrupt: Rc<RefCell<Interrupt>>) -> result::Resul
         interrupt.borrow_mut().do_interrupt_resample();
     }
 }
+*/
 
 async fn wait_kill(kill_evt: Event) -> result::Result<(), OtherError> {
     let kill_evt = EventAsync::try_from(kill_evt.0).map_err(OtherError::AsyncKillCreate)?;
@@ -446,10 +452,10 @@ async fn wait_kill(kill_evt: Event) -> result::Result<(), OtherError> {
     let _ = kill_evt.next_val().await;
     Ok(())
 }
-
+/*
 async fn handle_command_socket(
     command_socket: &Option<DiskControlResponseSocket>,
-    interrupt: Rc<RefCell<Interrupt>>,
+    interrupts: Rc<RefCell<Vec<Interrupt>>>,
     disk_state: Rc<RefCell<DiskState>>,
 ) -> Result<(), ExecuteError> {
     let command_socket = match command_socket {
@@ -475,7 +481,9 @@ async fn handle_command_socket(
                     .send(&resp)
                     .map_err(ExecuteError::SendingResponse)?;
                 if let DiskControlResult::Ok = resp {
-                    interrupt.borrow_mut().signal_config_changed();
+                    // TODO(dgreid) - This doesnt' make sense, config should be handled in the VMM.
+                    let ints = interrupts.borrow_mut();
+                    interrupts[0].signal_config_changed();
                 }
             }
             Err(e) => return Err(ExecuteError::ReceivingCommand(e)),
@@ -510,9 +518,10 @@ async fn resize(disk_state: &mut DiskState, new_size: u64) -> DiskControlResult 
     }
     DiskControlResult::Ok
 }
+*/
 
 fn run_worker(
-    interrupt: Interrupt,
+    interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
     queues: Vec<Queue>,
     mem: GuestMemory,
     disk_state: &Rc<RefCell<DiskState>>,
@@ -520,13 +529,16 @@ fn run_worker(
     queue_evts: Vec<Event>,
     kill_evt: Event,
 ) -> Result<(), String> {
-    // Wrap the interupt in a `RefCell` so it can be shared between async functions.
-    let interrupt = Rc::new(RefCell::new(interrupt));
-
     // One flush timer per disk.
     let flush_timer_armed = Rc::new(AtomicBool::new(false));
 
     // Handle all the queues in one sub-select call.
+    println!(
+        "run worker spawn queues {} {} {}",
+        queues.len(),
+        queue_evts.len(),
+        interrupts.len()
+    );
     let queue_handlers =
         queues
             .into_iter()
@@ -535,36 +547,39 @@ fn run_worker(
             .zip(queue_evts.into_iter().map(|e| {
                 EventAsync::try_from(e.0).expect("Failed to create async event for queue")
             }))
-            .map(|(queue, event)| {
+            .zip(interrupts.into_iter())
+            .map(|((queue, event), interrupt)| {
                 // alias some refs so the lifetimes work.
                 let mem = &mem;
                 let disk_state = &disk_state;
-                let interrupt = &interrupt;
+                println!("create handle queue box");
                 Box::pin(handle_queue(
                     mem,
                     Rc::clone(disk_state),
                     Rc::clone(&queue),
                     event,
-                    interrupt.clone(),
+                    interrupt,
                     Rc::clone(&flush_timer_armed),
                 ))
             })
             .collect::<FuturesUnordered<_>>()
             .into_future();
 
+    //TODO(dgreid) how to deal with resize?
     // Handles control requests.
-    let control = handle_command_socket(control_socket, interrupt.clone(), disk_state.clone());
-    pin_mut!(control);
+    //let control = handle_command_socket(control_socket, Rc::clone(&interrupts), disk_state.clone());
+    //pin_mut!(control);
 
     // Process any requests to resample the irq value.
-    let resample = handle_irq_resample(interrupt.clone());
-    pin_mut!(resample);
+    //TODO -not needed for vhost user let resample = handle_irq_resample(Rc::clone(interrupts));
+    //pin_mut!(resample);
     // Exit if the kill event is triggered.
     let kill = wait_kill(kill_evt);
     pin_mut!(kill);
 
     // And return once any future exits.
-    let _ = select4(queue_handlers, control, resample, kill);
+    println!("wait select2");
+    let _ = select2(queue_handlers, /*control, resample,*/ kill);
 
     Ok(())
 }
@@ -873,6 +888,16 @@ impl VirtioDevice for BlockAsync {
         queues: Vec<Queue>,
         queue_evts: Vec<Event>,
     ) {
+    } // TODO(dgreid)
+
+    fn activate_vhost(
+        &mut self,
+        mem: GuestMemory,
+        interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
+    ) {
+        println!("activate vhost");
         let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(e) => {
@@ -885,7 +910,9 @@ impl VirtioDevice for BlockAsync {
         let read_only = self.read_only;
         let sparse = self.sparse;
         let disk_size = self.disk_size.clone();
+        println!("activate vhost check disk");
         if let Some(disk_image) = self.disk_image.take() {
+            println!("activate vhost has disk");
             let control_socket = self.control_socket.take();
             let worker_result =
                 thread::Builder::new()
@@ -902,7 +929,7 @@ impl VirtioDevice for BlockAsync {
                             sparse,
                         }));
                         if let Err(err_string) = run_worker(
-                            interrupt,
+                            interrupts,
                             queues,
                             mem,
                             &disk_state,

@@ -533,10 +533,10 @@ impl Queue {
     /// inject interrupt into guest on this queue
     /// return true: interrupt is injected into guest for this queue
     ///        false: interrupt isn't injected
-    pub fn trigger_interrupt<T: SignalableInterrupt>(
+    pub fn trigger_interrupt(
         &mut self,
         mem: &GuestMemory,
-        interrupt: &T,
+        interrupt: &dyn SignalableInterrupt,
     ) -> bool {
         if self.available_interrupt_enabled(mem) {
             self.last_used = self.next_used;
