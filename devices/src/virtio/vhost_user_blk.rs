@@ -491,7 +491,8 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
 }
 
 fn main() -> Result<()> {
-    let backend = Arc::new(Mutex::new(BlockSlaveReqHandler::new("/tmp/blk.img")));
+    let args: Vec<String> = std::env::args().collect();
+    let backend = Arc::new(Mutex::new(BlockSlaveReqHandler::new(&args[1])));
     let listener = Listener::new("/tmp/vhost_user_blk.socket", true).unwrap();
     let mut slave_listener = SlaveListener::new(listener, backend).unwrap();
     let mut listener = slave_listener.accept().unwrap().unwrap();
