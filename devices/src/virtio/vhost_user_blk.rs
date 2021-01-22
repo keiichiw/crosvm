@@ -25,7 +25,7 @@ use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
-pub const VIRTIO_FEATURES: u64 = 0x4000_0003;
+pub const VIRTIO_TRANSPORT_FEATURES: u64 = 0x1_4000_0000;
 
 struct CallEvent(Event);
 
@@ -214,10 +214,9 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
     }
 
     fn get_features(&mut self) -> Result<u64> {
-        println!("get_features {:x}", VIRTIO_FEATURES);
-        // dg-- qemu doesn't seem to ack, so assume features are enabled.
-        //        self.acked_features = VIRTIO_FEATURES;
-        Ok(VIRTIO_FEATURES)
+        let features = self.block.features() | VIRTIO_TRANSPORT_FEATURES;
+        println!("get_features {:x}", features);
+        Ok(features)
     }
 
     fn set_features(&mut self, features: u64) -> Result<()> {
@@ -225,7 +224,7 @@ impl VhostUserSlaveReqHandler for BlockSlaveReqHandler {
         if !self.owned {
             println!("set_features unowned");
             return Err(Error::InvalidOperation);
-        } else if (features & !VIRTIO_FEATURES) != 0 {
+        } else if (features & !(self.block.features() | VIRTIO_TRANSPORT_FEATURES)) != 0 {
             println!("set_features no features");
             return Err(Error::InvalidParam);
         }
