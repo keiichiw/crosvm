@@ -24,7 +24,7 @@ use devices::virtio::SignalableInterrupt;
 use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
 
 pub const MAX_QUEUE_NUM: usize = 2;
-pub const MAX_VRING_NUM: usize = 256;
+pub const MAX_VRING_NUM: usize = 32768;
 pub const VIRTIO_TRANSPORT_FEATURES: u64 = 0x1_4000_0000;
 
 struct CallEvent(Event);
