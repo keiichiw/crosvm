@@ -276,7 +276,7 @@ async fn process_one_request_task(
     avail_desc: DescriptorChain,
     disk_state: Rc<AsyncMutex<DiskState>>,
     mem: GuestMemory,
-    interrupt: Rc<RefCell<Interrupt>>,
+    interrupt: Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>,
     flush_timer: Rc<RefCell<TimerAsync>>,
     flush_timer_armed: Rc<RefCell<bool>>,
 ) {
@@ -294,7 +294,7 @@ async fn process_one_request_task(
 
     let mut queue = queue.borrow_mut();
     queue.add_used(&mem, descriptor_index, len as u32);
-    queue.trigger_interrupt(&mem, &*interrupt.borrow());
+    queue.trigger_interrupt(&mem, &**interrupt.borrow());
     queue.update_int_required(&mem);
 }
 
@@ -307,7 +307,7 @@ async fn handle_queue(
     disk_state: Rc<AsyncMutex<DiskState>>,
     queue: Rc<RefCell<Queue>>,
     evt: EventAsync,
-    interrupt: Rc<RefCell<Interrupt>>,
+    interrupt: Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>,
     flush_timer: Rc<RefCell<TimerAsync>>,
     flush_timer_armed: Rc<RefCell<bool>>,
 ) {
@@ -333,21 +333,30 @@ async fn handle_queue(
 
 async fn handle_irq_resample(
     ex: &Executor,
-    interrupt: Rc<RefCell<Interrupt>>,
+    interrupt: Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>,
 ) -> result::Result<(), OtherError> {
-    let resample_evt = interrupt
-        .borrow_mut()
-        .get_resample_evt()
-        .try_clone()
-        .map_err(OtherError::CloneResampleEvent)?;
-    let resample_evt =
-        EventAsync::new(resample_evt.0, ex).map_err(OtherError::AsyncResampleCreate)?;
-    loop {
-        let _ = resample_evt
-            .next_val()
-            .await
-            .map_err(OtherError::ReadResampleEvent)?;
-        interrupt.borrow_mut().do_interrupt_resample();
+    let resample_evt = if let Some(resample_evt) = interrupt.borrow().get_resample_evt() {
+        let resample_evt = resample_evt
+            .try_clone()
+            .map_err(OtherError::CloneResampleEvent)?;
+        let resample_evt =
+            EventAsync::new(resample_evt.0, ex).map_err(OtherError::AsyncResampleCreate)?;
+        Some(resample_evt)
+    } else {
+        None
+    };
+    if let Some(resample_evt) = resample_evt {
+        loop {
+            let _ = resample_evt
+                .next_val()
+                .await
+                .map_err(OtherError::ReadResampleEvent)?;
+            interrupt.borrow().do_interrupt_resample();
+        }
+    } else {
+        // no resample event, park the future.
+        let () = futures::future::pending().await;
+        Ok(())
     }
 }
 
@@ -360,7 +369,7 @@ async fn wait_kill(kill_evt: EventAsync) {
 async fn handle_command_socket(
     ex: &Executor,
     command_socket: &Option<DiskControlResponseSocket>,
-    interrupt: Rc<RefCell<Interrupt>>,
+    interrupt: Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>,
     disk_state: Rc<AsyncMutex<DiskState>>,
 ) -> Result<(), ExecuteError> {
     let command_socket = match command_socket {
@@ -386,6 +395,7 @@ async fn handle_command_socket(
                     .send(&resp)
                     .map_err(ExecuteError::SendingResponse)?;
                 if let DiskControlResult::Ok = resp {
+                    // TODO(dgreid) - This doesnt' make sense, config should be handled in the VMM.
                     interrupt.borrow_mut().signal_config_changed();
                 }
             }
@@ -458,7 +468,7 @@ async fn flush_disk(
 // a resizing command.
 fn run_worker(
     ex: Executor,
-    interrupt: Interrupt,
+    interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
     queues: Vec<Queue>,
     mem: GuestMemory,
     disk_state: &Rc<AsyncMutex<DiskState>>,
@@ -466,12 +476,29 @@ fn run_worker(
     queue_evts: Vec<Event>,
     kill_evt: Event,
 ) -> Result<(), String> {
-    // Wrap the interupt in a `RefCell` so it can be shared between async functions.
-    let interrupt = Rc::new(RefCell::new(interrupt));
-
     // One flush timer per disk.
     let timer = Timer::new().expect("Failed to create a timer");
     let flush_timer_armed = Rc::new(RefCell::new(false));
+
+    let interrupts: Vec<Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>> = interrupts
+        .into_iter()
+        .map(|i| Rc::new(RefCell::new(i)))
+        .collect();
+
+    let (resample, control) = if let Some(int) = interrupts.get(0) {
+        // Process any requests to resample the irq value.
+        let resample = handle_irq_resample(&ex, Rc::clone(int));
+
+        // Handles control requests.
+        let control =
+            handle_command_socket(&ex, control_socket, Rc::clone(int), disk_state.clone());
+
+        (resample, control)
+    } else {
+        return Err(format!("Not enough interrupts"));
+    };
+    pin_mut!(resample);
+    pin_mut!(control);
 
     // Handle all the queues in one sub-select call.
     let flush_timer = Rc::new(RefCell::new(
@@ -489,18 +516,18 @@ fn run_worker(
             .zip(queue_evts.into_iter().map(|e| {
                 EventAsync::new(e.0, &ex).expect("Failed to create async event for queue")
             }))
-            .map(|(queue, event)| {
+            .zip(interrupts.into_iter())
+            .map(|((queue, event), interrupt)| {
                 // alias some refs so the lifetimes work.
                 let mem = &mem;
                 let disk_state = &disk_state;
-                let interrupt = &interrupt;
                 handle_queue(
                     &ex,
                     mem,
                     Rc::clone(&disk_state),
                     Rc::clone(&queue),
                     event,
-                    interrupt.clone(),
+                    interrupt,
                     Rc::clone(&flush_timer),
                     Rc::clone(&flush_timer_armed),
                 )
@@ -512,14 +539,6 @@ fn run_worker(
     let flush_timer = TimerAsync::new(timer.0, &ex).expect("Failed to create an async timer");
     let disk_flush = flush_disk(disk_state.clone(), flush_timer, flush_timer_armed.clone());
     pin_mut!(disk_flush);
-
-    // Handles control requests.
-    let control = handle_command_socket(&ex, control_socket, interrupt.clone(), disk_state.clone());
-    pin_mut!(control);
-
-    // Process any requests to resample the irq value.
-    let resample = handle_irq_resample(&ex, interrupt.clone());
-    pin_mut!(resample);
 
     // Exit if the kill event is triggered.
     let kill_evt = EventAsync::new(kill_evt.0, &ex).expect("Failed to create async kill event fd");
@@ -851,6 +870,15 @@ impl VirtioDevice for BlockAsync {
         queues: Vec<Queue>,
         queue_evts: Vec<Event>,
     ) {
+    } // TODO(dgreid)
+
+    fn activate_vhost(
+        &mut self,
+        mem: GuestMemory,
+        interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
+    ) {
         let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(e) => {
@@ -882,7 +910,7 @@ impl VirtioDevice for BlockAsync {
                         }));
                         if let Err(err_string) = run_worker(
                             ex,
-                            interrupt,
+                            interrupts,
                             queues,
                             mem,
                             &disk_state,

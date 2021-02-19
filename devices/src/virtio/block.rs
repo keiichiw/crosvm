@@ -70,7 +70,7 @@ const VIRTIO_BLK_F_WRITE_ZEROES: u32 = 14;
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
-struct virtio_blk_geometry {
+pub struct virtio_blk_geometry {
     cylinders: Le16,
     heads: u8,
     sectors: u8,
@@ -81,7 +81,7 @@ unsafe impl DataInit for virtio_blk_geometry {}
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
-struct virtio_blk_topology {
+pub struct virtio_blk_topology {
     physical_block_exp: u8,
     alignment_offset: u8,
     min_io_size: Le16,
@@ -93,7 +93,7 @@ unsafe impl DataInit for virtio_blk_topology {}
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
-struct virtio_blk_config {
+pub struct virtio_blk_config {
     capacity: Le64,
     size_max: Le32,
     seg_max: Le32,
@@ -507,7 +507,7 @@ pub struct Block {
     control_socket: Option<DiskControlResponseSocket>,
 }
 
-fn build_config_space(disk_size: u64, seg_max: u32, block_size: u32) -> virtio_blk_config {
+pub fn build_config_space(disk_size: u64, seg_max: u32, block_size: u32) -> virtio_blk_config {
     virtio_blk_config {
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
         capacity: Le64::from(disk_size >> SECTOR_SHIFT),

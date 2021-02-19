@@ -24,7 +24,6 @@ use data_model::DataInit;
 
 #[derive(Debug)]
 pub enum Error {
-    DescriptorChainOverflow,
     InvalidGuestAddress(GuestAddress),
     MemoryAccess(GuestAddress, MmapError),
     MemoryMappingFailed(MmapError),
@@ -47,10 +46,6 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
-            DescriptorChainOverflow => write!(
-                f,
-                "the combined length of all the buffers in a DescriptorChain is too large"
-            ),
             InvalidGuestAddress(addr) => write!(f, "invalid guest address {}", addr),
             MemoryAccess(addr, e) => {
                 write!(f, "invalid guest memory access at addr={}: {}", addr, e)
@@ -83,7 +78,10 @@ impl Display for Error {
     }
 }
 
-struct MemoryRegion {
+/// A regions of memory mapped memory.
+/// Holds the memory mapping with its offset in guest memory.
+/// Also holds the backing fd for the mapping and the offset in that fd of the mapping.
+pub struct MemoryRegion {
     mapping: MemoryMapping,
     guest_base: GuestAddress,
     shm_offset: u64,
@@ -91,6 +89,27 @@ struct MemoryRegion {
 }
 
 impl MemoryRegion {
+    /// Creates a new MemoryRegion using the given SharedMemory object to later be attached to a VM
+    /// at `guest_base` address in the guest.
+    pub fn new(
+        size: u64,
+        guest_base: GuestAddress,
+        shm_offset: u64,
+        shm: Arc<SharedMemory>,
+    ) -> Result<Self> {
+        let mapping = MemoryMappingBuilder::new(size as usize)
+            .from_descriptor(shm.as_ref())
+            .offset(shm_offset)
+            .build()
+            .map_err(Error::MemoryMappingFailed)?;
+        Ok(MemoryRegion {
+            mapping,
+            guest_base,
+            shm_offset,
+            shm,
+        })
+    }
+
     fn start(&self) -> GuestAddress {
         self.guest_base
     }
@@ -189,6 +208,32 @@ impl GuestMemory {
             });
 
             offset += size as u64;
+        }
+
+        Ok(GuestMemory {
+            regions: Arc::from(regions),
+        })
+    }
+
+    /// Creates a `GuestMemory` from a collection of MemoryRegions.
+    pub fn from_regions(mut regions: Vec<MemoryRegion>) -> Result<Self> {
+        // Sort the regions and ensure non overlap.
+        regions.sort_by(|a, b| a.guest_base.cmp(&b.guest_base));
+
+        if regions.len() > 1 {
+            let mut prev_end = regions[0]
+                .guest_base
+                .checked_add(regions[0].mapping.size() as u64)
+                .ok_or(Error::MemoryRegionOverlap)?;
+            for region in &regions[1..] {
+                if prev_end > region.guest_base {
+                    return Err(Error::MemoryRegionOverlap);
+                }
+                prev_end = region
+                    .guest_base
+                    .checked_add(region.mapping.size() as u64)
+                    .ok_or(Error::MemoryRegionOverlap)?;
+            }
         }
 
         Ok(GuestMemory {

@@ -676,6 +676,7 @@ impl PciDevice for VirtioPciDevice {
                         None
                     }
                 };
+
                 if let Some(interrupt_resample_evt) = self.interrupt_resample_evt.take() {
                     self.interrupt_resample_evt = match interrupt_resample_evt.try_clone() {
                         Ok(evt) => Some(evt),

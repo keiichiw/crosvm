@@ -11,7 +11,7 @@ use cros_async::{AsyncError, EventAsync};
 use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{GuestAddress, GuestMemory};
 
-use super::{SignalableInterrupt, VIRTIO_MSI_NO_VECTOR};
+use super::{Interrupt, SignalableInterrupt, VIRTIO_MSI_NO_VECTOR};
 
 const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 const VIRTQ_DESC_F_WRITE: u16 = 0x2;

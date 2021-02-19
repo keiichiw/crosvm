@@ -56,6 +56,7 @@ vhost = { path = "../vhost" }
 virtio_sys = { path = "../virtio_sys" }
 vm_control = { path = "../vm_control" }
 vm_memory = { path = "../vm_memory" }
+vmm_vhost = { path = "../../../third_party/rust-vmm/vhost", features = ["vhost-user-slave"] }
 
 [dependencies.futures]
 version = "*"
@@ -63,3 +64,11 @@ default-features = false
 
 [dev-dependencies]
 tempfile = { path = "../tempfile" }
+
+[lib]
+name = "devices"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vhost_user_blk"
+path = "src/virtio/vhost_user_blk.rs"
