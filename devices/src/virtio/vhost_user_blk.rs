@@ -493,6 +493,21 @@ impl VhostUserSlaveReqHandlerMut for BlockSlaveReqHandler {
     fn set_slave_req_fd(&mut self, vu_req: SlaveFsCacheReq) {
         self.vu_req = Some(vu_req);
     }
+
+    fn get_max_mem_slots(&mut self) -> Result<u64> {
+        //TODO
+        Ok(0)
+    }
+
+    fn add_mem_region(&mut self, region: &VhostUserSingleMemoryRegion, fd: RawFd) -> Result<()> {
+        //TODO
+        Ok(())
+    }
+
+    fn remove_mem_region(&mut self, region: &VhostUserSingleMemoryRegion) -> Result<()> {
+        //TODO
+        Ok(())
+    }
 }
 
 fn main() {
