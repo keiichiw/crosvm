@@ -870,7 +870,8 @@ impl VirtioDevice for BlockAsync {
         queues: Vec<Queue>,
         queue_evts: Vec<Event>,
     ) {
-    } // TODO(dgreid)
+        self.activate_vhost(mem, vec![Box::new(interrupt)], queues, queue_evts)
+    }
 
     fn activate_vhost(
         &mut self,
