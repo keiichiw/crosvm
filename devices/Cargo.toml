@@ -71,4 +71,4 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "vhost_user_blk"
-path = "src/virtio/vhost_user_blk.rs"
+path = "src/virtio/vhost/user/backend/block.rs"

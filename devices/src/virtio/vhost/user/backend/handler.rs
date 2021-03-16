@@ -1,10 +1,4 @@
-// Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
-extern crate vhost;
-
-use std::fs::OpenOptions;
 use std::os::unix::io::RawFd;
-use std::path::Path;
 use std::sync::Arc;
 
 use vmm_vhost::vhost_user::message::*;
@@ -16,8 +10,7 @@ use base::{
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
 use devices::virtio::SignalableInterrupt;
-use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
-use devices::ProtectionType;
+use devices::virtio::{Queue, VirtioDevice};
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
@@ -78,7 +71,7 @@ struct MemInfo {
     vmm_maps: Vec<MappingInfo>,
 }
 
-pub struct BlockSlaveReqHandler {
+pub struct DevReqHandler<D: VirtioDevice> {
     pub owned: bool,
     pub features_acked: bool,
     pub acked_features: u64,
@@ -94,27 +87,12 @@ pub struct BlockSlaveReqHandler {
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
     mem: Option<MemInfo>,
-    block: BlockAsync,
+    device: D,
 }
 
-impl BlockSlaveReqHandler {
-    pub fn new<P: AsRef<Path>>(filename: P) -> Self {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(false)
-            .open(filename)
-            .unwrap();
-        let block = BlockAsync::new(
-            base_features(ProtectionType::Unprotected),
-            Box::new(f),
-            false, /*read-only*/
-            false, /*sparse*/
-            512,
-            None,
-        )
-        .unwrap();
-        BlockSlaveReqHandler {
+impl<D: VirtioDevice> DevReqHandler<D> {
+    pub fn new(device: D) -> Self {
+        DevReqHandler {
             owned: false,
             features_acked: false,
             acked_features: 0,
@@ -130,7 +108,7 @@ impl BlockSlaveReqHandler {
             vring_enabled: [false; MAX_QUEUE_NUM],
             vu_req: None,
             mem: None,
-            block,
+            device,
         }
     }
 
@@ -157,10 +135,10 @@ impl BlockSlaveReqHandler {
             return;
         }
         println!("-------- start dev");
-        self.start_block_dev();
+        self.start_dev();
     }
 
-    fn start_block_dev(&mut self) {
+    fn start_dev(&mut self) {
         let call_events = self
             .call_fd
             .iter_mut()
@@ -189,8 +167,8 @@ impl BlockSlaveReqHandler {
             .filter(|o| o.is_some())
             .map(|event| event.take().unwrap())
             .collect();
-        self.block.reset();
-        self.block.activate_vhost(
+        self.device.reset();
+        self.device.activate_vhost(
             self.mem.as_ref().unwrap().guest_mem.clone(),
             call_events,
             queues,
@@ -199,7 +177,7 @@ impl BlockSlaveReqHandler {
     }
 }
 
-impl VhostUserSlaveReqHandlerMut for BlockSlaveReqHandler {
+impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
     fn set_owner(&mut self) -> Result<()> {
         println!("set_owner");
         if self.owned {
@@ -219,7 +197,7 @@ impl VhostUserSlaveReqHandlerMut for BlockSlaveReqHandler {
     }
 
     fn get_features(&mut self) -> Result<u64> {
-        let features = self.block.features() | VIRTIO_TRANSPORT_FEATURES;
+        let features = self.device.features() | VIRTIO_TRANSPORT_FEATURES;
         println!("get_features {:x}", features);
         Ok(features)
     }
@@ -229,7 +207,7 @@ impl VhostUserSlaveReqHandlerMut for BlockSlaveReqHandler {
         if !self.owned {
             println!("set_features unowned");
             return Err(Error::InvalidOperation);
-        } else if (features & !(self.block.features() | VIRTIO_TRANSPORT_FEATURES)) != 0 {
+        } else if (features & !(self.device.features() | VIRTIO_TRANSPORT_FEATURES)) != 0 {
             println!("set_features no features");
             return Err(Error::InvalidParam);
         }
@@ -473,7 +451,7 @@ impl VhostUserSlaveReqHandlerMut for BlockSlaveReqHandler {
             return Err(Error::InvalidParam);
         }
         let mut data = vec![0; size as usize];
-        self.block.read_config(u64::from(offset), &mut data);
+        self.device.read_config(u64::from(offset), &mut data);
         Ok(data)
     }
 
@@ -499,24 +477,13 @@ impl VhostUserSlaveReqHandlerMut for BlockSlaveReqHandler {
         Ok(0)
     }
 
-    fn add_mem_region(&mut self, region: &VhostUserSingleMemoryRegion, fd: RawFd) -> Result<()> {
+    fn add_mem_region(&mut self, _region: &VhostUserSingleMemoryRegion, _fd: RawFd) -> Result<()> {
         //TODO
         Ok(())
     }
 
-    fn remove_mem_region(&mut self, region: &VhostUserSingleMemoryRegion) -> Result<()> {
+    fn remove_mem_region(&mut self, _region: &VhostUserSingleMemoryRegion) -> Result<()> {
         //TODO
         Ok(())
-    }
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let backend = Arc::new(std::sync::Mutex::new(BlockSlaveReqHandler::new(&args[1])));
-    let listener = Listener::new("/tmp/vhost_user_blk.socket", true).unwrap();
-    let mut slave_listener = SlaveListener::new(listener, backend).unwrap();
-    let mut listener = slave_listener.accept().unwrap().unwrap();
-    loop {
-        listener.handle_request().unwrap();
     }
 }
