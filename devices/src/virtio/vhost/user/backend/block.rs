@@ -13,6 +13,11 @@ use handler::DevReqHandler;
 use vmm_vhost::vhost_user::*;
 
 fn main() {
+    if let Err(e) = base::syslog::init() {
+        println!("failed to initialize syslog: {}", e);
+        return;
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let filename = &args[1];
     let f = OpenOptions::new()
