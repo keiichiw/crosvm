@@ -8,7 +8,6 @@ use std::mem;
 use std::net::Ipv4Addr;
 use std::os::raw::c_uint;
 use std::result;
-use std::sync::Arc;
 use std::thread;
 
 use base::Error as SysError;
@@ -146,7 +145,7 @@ struct VirtioNetConfig {
 unsafe impl DataInit for VirtioNetConfig {}
 
 struct Worker<T: TapT> {
-    interrupt: Arc<Interrupt>,
+    interrupt: Box<dyn SignalableInterrupt + Send>,
     mem: GuestMemory,
     rx_queue: Queue,
     tx_queue: Queue,
@@ -408,7 +407,7 @@ where
                         }
                     }
                     Token::InterruptResample => {
-                        self.interrupt.interrupt_resample();
+                        self.interrupt.do_interrupt_resample();
                     }
                     Token::Kill => {
                         let _ = self.kill_evt.read();
@@ -634,6 +633,10 @@ where
         }
     }
 
+    fn acked_features(&self) -> u64 {
+        self.acked_features
+    }
+
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         let config_space = self.build_config();
         copy_config(data, 0, config_space.as_slice(), offset);
@@ -643,8 +646,8 @@ where
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: Vec<Queue>,
-        mut queue_evts: Vec<Event>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
     ) {
         let enable_ctrlq = (self.acked_features & 1 << virtio_net::VIRTIO_NET_F_CTRL_VQ) != 0
             && queues.len() % 2 == 1;
@@ -663,12 +666,35 @@ where
             return;
         }
 
-        let vq_pairs = self.queue_sizes.len() / 2;
-        if self.taps.len() != vq_pairs {
+        self.activate_vhost(mem, vec![Box::new(interrupt)], queues, queue_evts)
+    }
+
+    fn activate_vhost(
+        &mut self,
+        mem: GuestMemory,
+        mut interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
+        mut queues: Vec<Queue>,
+        mut queue_evts: Vec<Event>,
+    ) {
+        println!(
+            "activate_vhost: ({}, {}), ({}, {})",
+            queues.len(),
+            self.queue_sizes.len(),
+            queue_evts.len(),
+            self.queue_sizes.len()
+        );
+
+        let vq_pairs = queues.len() / 2;
+        println!(
+            "activate_vhost: queue_sizes.len()={}, vq_pairs={}",
+            queues.len() / 2,
+            vq_pairs
+        );
+        if self.taps.len() < vq_pairs {
             error!("net: expected {} taps, got {}", vq_pairs, self.taps.len());
             return;
         }
-        if self.workers_kill_evt.len() != vq_pairs {
+        if self.workers_kill_evt.len() < vq_pairs {
             error!(
                 "net: expected {} worker_kill_evt, got {}",
                 vq_pairs,
@@ -676,11 +702,13 @@ where
             );
             return;
         }
-        let interrupt_arc = Arc::new(interrupt);
+
+        let enable_ctrlq = (self.acked_features & 1 << virtio_net::VIRTIO_NET_F_CTRL_VQ) != 0
+            && queues.len() % 2 == 1;
         for i in 0..vq_pairs {
             let tap = self.taps.remove(0);
             let acked_features = self.acked_features;
-            let interrupt = interrupt_arc.clone();
+            let interrupt = interrupts.remove(0);
             let memory = mem.clone();
             let kill_evt = self.workers_kill_evt.remove(0);
             // Queues alternate between rx0, tx0, rx1, tx1, ..., rxN, txN (, ctrl).

@@ -4,44 +4,34 @@
 
 pub mod handler;
 
-use std::fs::OpenOptions;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use devices::virtio::{base_features, BlockAsync, VirtioDevice};
+use devices::virtio::{base_features, Net, VirtioDevice};
 use devices::ProtectionType;
-use disk::ToAsyncDisk;
 use getopts::Options;
 use handler::VhostUserDeviceReqHandler;
-use vm_control::DiskControlResponseSocket;
+use net_util::{MacAddress, Tap};
 use vmm_vhost::vhost_user::message::*;
 use vmm_vhost::vhost_user::*;
 
 use crate::handler::VhostUserBackend;
 
-struct BlockBackend {
-    device: BlockAsync,
+struct NetBackend {
+    device: Net<Tap>,
     acked_protocol_features: u64,
 }
 
-impl BlockBackend {
-    fn new(
+impl NetBackend {
+    pub fn new(
         base_features: u64,
-        disk_image: Box<dyn ToAsyncDisk>,
-        read_only: bool,
-        sparse: bool,
-        block_size: u32,
-        control_socket: Option<DiskControlResponseSocket>,
+        host_ip: Ipv4Addr,
+        netmask: Ipv4Addr,
+        mac_address: MacAddress,
+        vq_pairs: u16,
     ) -> Self {
-        let device = BlockAsync::new(
-            base_features,
-            disk_image,
-            read_only,
-            sparse,
-            block_size,
-            control_socket,
-        )
-        .expect("failed to create async block");
-
+        let device = Net::<Tap>::new(base_features, host_ip, netmask, mac_address, vq_pairs)
+            .expect("failed to create net device");
         Self {
             device,
             acked_protocol_features: 0,
@@ -49,9 +39,9 @@ impl BlockBackend {
     }
 }
 
-impl VhostUserBackend for BlockBackend {
+impl VhostUserBackend for NetBackend {
     fn expected_queue_num(&self) -> usize {
-        1
+        2
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -63,6 +53,12 @@ impl VhostUserBackend for BlockBackend {
     }
 
     fn ack_protocol_features(&mut self, features: u64) {
+        // Note: slave that reported VHOST_USER_F_PROTOCOL_FEATURES must
+        // support this message even before VHOST_USER_SET_FEATURES was
+        // called.
+        // What happens if the master calls set_features() with
+        // VHOST_USER_F_PROTOCOL_FEATURES cleared after calling this
+        // interface?
         self.acked_protocol_features = features;
     }
 
@@ -78,7 +74,6 @@ impl VhostUserBackend for BlockBackend {
     fn device(&self) -> &dyn VirtioDevice {
         &self.device
     }
-
     fn device_mut(&mut self) -> &mut dyn VirtioDevice {
         &mut self.device
     }
@@ -92,7 +87,14 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let mut opts = Options::new();
-    opts.reqopt("", "disk", "Path to a disk image.", "PATH");
+    opts.reqopt(
+        "",
+        "host_ip",
+        "IP address to assign to host tap interface.",
+        "IP",
+    );
+    opts.reqopt("", "netmask", "Netmask for VM subnet.", "NETMASK");
+    opts.reqopt("", "mac", "MAC address for VM.", "MAC");
     opts.reqopt("", "socket", "Path to a socket", "PATH");
 
     let matches = match opts.parse(&args[1..]) {
@@ -103,26 +105,21 @@ fn main() {
             return;
         }
     };
-    let disk = matches.opt_str("disk").unwrap();
+
+    let features = base_features(ProtectionType::Unprotected);
+    let host_ip: Ipv4Addr = matches.opt_str("host_ip").unwrap().parse().unwrap();
+    let netmask: Ipv4Addr = matches.opt_str("netmask").unwrap().parse().unwrap();
+    let mac_address: MacAddress = matches.opt_str("mac").unwrap().parse().unwrap();
     let socket = matches.opt_str("socket").unwrap();
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(false)
-        .open(disk)
-        .unwrap();
-    let block = BlockBackend::new(
-        base_features(ProtectionType::Unprotected),
-        Box::new(f),
-        false, /*read-only*/
-        false, /*sparse*/
-        512,
-        None,
-    );
-    let handler = Arc::new(std::sync::Mutex::new(VhostUserDeviceReqHandler::new(block)));
+    let vq_pairs = 1;
+
+    let net = NetBackend::new(features, host_ip, netmask, mac_address, vq_pairs);
+    let handler = Arc::new(std::sync::Mutex::new(VhostUserDeviceReqHandler::new(net)));
     let listener = Listener::new(socket, true).unwrap();
     let mut slave_listener = SlaveListener::new(listener, handler).unwrap();
+    println!("waiting");
     let mut listener = slave_listener.accept().unwrap().unwrap();
+    println!("accepted");
     loop {
         listener.handle_request().unwrap();
     }

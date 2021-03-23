@@ -9,8 +9,7 @@ use base::{
 };
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
-use devices::virtio::SignalableInterrupt;
-use devices::virtio::{Queue, VirtioDevice};
+use devices::virtio::{Queue, SignalableInterrupt, VirtioDevice};
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
@@ -71,11 +70,55 @@ struct MemInfo {
     vmm_maps: Vec<MappingInfo>,
 }
 
-pub struct DevReqHandler<D: VirtioDevice> {
+pub trait VhostUserBackend {
+    /// Returns the number or queues that the vmm is expected to send.
+    ///
+    /// FIXME(keiichiw): this must be fixed because the device cannot know how many queues the vmm
+    /// will use in total. Instead, we should allow to activate devices with uninitialized Queues
+    /// and set up them later.
+    fn expected_queue_num(&self) -> usize;
+
+    /// TODO(keiichiw): This method will allow `set_vring_*` to set up a `Queue` after the device is activated.
+    // fn queue_mut(&mut self, index: usize) -> &mut Queue;
+
+    fn protocol_features(&self) -> VhostUserProtocolFeatures;
+    fn ack_protocol_features(&mut self, _value: u64);
+    fn acked_protocol_features(&self) -> u64;
+    fn reset(&mut self);
+    fn device(&self) -> &dyn VirtioDevice;
+    fn device_mut(&mut self) -> &mut dyn VirtioDevice;
+
+    fn features(&self) -> u64 {
+        self.device().features()
+    }
+
+    fn ack_features(&mut self, value: u64) {
+        self.device_mut().ack_features(value)
+    }
+
+    fn acked_features(&self) -> u64 {
+        self.device().acked_features()
+    }
+
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        self.device().read_config(offset, data)
+    }
+
+    fn activate_vhost(
+        &mut self,
+        mem: GuestMemory,
+        interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
+    ) {
+        self.device_mut()
+            .activate_vhost(mem, interrupts, queues, queue_evts)
+    }
+}
+
+pub struct VhostUserDeviceReqHandler<B: VhostUserBackend> {
     pub owned: bool,
     pub features_acked: bool,
-    pub acked_features: u64,
-    pub acked_protocol_features: u64,
     pub queue_num: usize,
     pub vring_num: [u32; MAX_QUEUE_NUM],
     pub vring_base: [u32; MAX_QUEUE_NUM],
@@ -87,16 +130,14 @@ pub struct DevReqHandler<D: VirtioDevice> {
     pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
     mem: Option<MemInfo>,
-    device: D,
+    backend: B,
 }
 
-impl<D: VirtioDevice> DevReqHandler<D> {
-    pub fn new(device: D) -> Self {
-        DevReqHandler {
+impl<B: VhostUserBackend> VhostUserDeviceReqHandler<B> {
+    pub fn new(backend: B) -> Self {
+        VhostUserDeviceReqHandler {
             owned: false,
             features_acked: false,
-            acked_features: 0,
-            acked_protocol_features: 0,
             queue_num: MAX_QUEUE_NUM,
             vring_num: [0; MAX_QUEUE_NUM],
             vring_base: [0; MAX_QUEUE_NUM],
@@ -108,14 +149,14 @@ impl<D: VirtioDevice> DevReqHandler<D> {
             vring_enabled: [false; MAX_QUEUE_NUM],
             vu_req: None,
             mem: None,
-            device,
+            backend,
         }
     }
 
     fn potentially_start_dev(&mut self) {
         let num_queues = self.queue_info.iter().filter(|o| o.is_some()).count();
-        if num_queues < 1 {
-            println!("no queue info {} {}", num_queues, self.queue_num);
+        // HACK(keiichiw)
+        if num_queues < self.backend.expected_queue_num() {
             return;
         }
         if self.kick_fd.iter().filter(|o| o.is_some()).count() < num_queues {
@@ -134,6 +175,11 @@ impl<D: VirtioDevice> DevReqHandler<D> {
             );
             return;
         }
+
+        for i in 0..num_queues {
+            println!("keiichiw: vring_enabled[{}]={}", i, self.vring_enabled[i]);
+        }
+
         println!("-------- start dev");
         self.start_dev();
     }
@@ -167,8 +213,8 @@ impl<D: VirtioDevice> DevReqHandler<D> {
             .filter(|o| o.is_some())
             .map(|event| event.take().unwrap())
             .collect();
-        self.device.reset();
-        self.device.activate_vhost(
+        self.backend.reset();
+        self.backend.activate_vhost(
             self.mem.as_ref().unwrap().guest_mem.clone(),
             call_events,
             queues,
@@ -177,7 +223,7 @@ impl<D: VirtioDevice> DevReqHandler<D> {
     }
 }
 
-impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
+impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHandler<B> {
     fn set_owner(&mut self) -> Result<()> {
         println!("set_owner");
         if self.owned {
@@ -191,13 +237,12 @@ impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
         println!("reset_owner");
         self.owned = false;
         self.features_acked = false;
-        self.acked_features = 0;
-        self.acked_protocol_features = 0;
+        self.backend.reset();
         Ok(())
     }
 
     fn get_features(&mut self) -> Result<u64> {
-        let features = self.device.features() | VIRTIO_TRANSPORT_FEATURES;
+        let features = self.backend.features() | VIRTIO_TRANSPORT_FEATURES;
         println!("get_features {:x}", features);
         Ok(features)
     }
@@ -207,12 +252,12 @@ impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
         if !self.owned {
             println!("set_features unowned");
             return Err(Error::InvalidOperation);
-        } else if (features & !(self.device.features() | VIRTIO_TRANSPORT_FEATURES)) != 0 {
+        } else if (features & !(self.backend.features() | VIRTIO_TRANSPORT_FEATURES)) != 0 {
             println!("set_features no features");
             return Err(Error::InvalidParam);
         }
 
-        self.acked_features = features;
+        self.backend.ack_features(features);
         self.features_acked = true;
 
         // If VHOST_USER_F_PROTOCOL_FEATURES has not been negotiated,
@@ -223,7 +268,7 @@ impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
         // VHOST_USER_SET_VRING_ENABLE with parameter 1, or after it has
         // been disabled by VHOST_USER_SET_VRING_ENABLE with parameter 0.
         let vring_enabled =
-            self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0;
+            self.backend.acked_features() & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0;
         for enabled in &mut self.vring_enabled {
             *enabled = vring_enabled;
         }
@@ -233,22 +278,12 @@ impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
 
     fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures> {
         println!("get_protocol_features");
-        let mut features = VhostUserProtocolFeatures::all();
-        features.remove(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS);
-        features.remove(VhostUserProtocolFeatures::INFLIGHT_SHMFD);
-        features.remove(VhostUserProtocolFeatures::SLAVE_REQ);
-        Ok(features)
+        Ok(self.backend.protocol_features())
     }
 
     fn set_protocol_features(&mut self, features: u64) -> Result<()> {
         println!("set_protocol_features");
-        // Note: slave that reported VHOST_USER_F_PROTOCOL_FEATURES must
-        // support this message even before VHOST_USER_SET_FEATURES was
-        // called.
-        // What happens if the master calls set_features() with
-        // VHOST_USER_F_PROTOCOL_FEATURES cleared after calling this
-        // interface?
-        self.acked_protocol_features = features;
+        self.backend.ack_protocol_features(features);
         Ok(())
     }
 
@@ -422,10 +457,10 @@ impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
     }
 
     fn set_vring_enable(&mut self, index: u32, enable: bool) -> Result<()> {
-        println!("vring_enable");
+        println!("vring_enable: index={}, enable={}", index, enable);
         // This request should be handled only when VHOST_USER_F_PROTOCOL_FEATURES
         // has been negotiated.
-        if self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
+        if self.backend.acked_features() & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
             return Err(Error::InvalidOperation);
         } else if index as usize >= self.queue_num || index as usize > self.queue_num {
             return Err(Error::InvalidParam);
@@ -451,7 +486,7 @@ impl<D: VirtioDevice> VhostUserSlaveReqHandlerMut for DevReqHandler<D> {
             return Err(Error::InvalidParam);
         }
         let mut data = vec![0; size as usize];
-        self.device.read_config(u64::from(offset), &mut data);
+        self.backend.read_config(u64::from(offset), &mut data);
         Ok(data)
     }
 

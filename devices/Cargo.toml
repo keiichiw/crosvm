@@ -24,6 +24,7 @@ data_model = { path = "../data_model" }
 disk = { path = "../disk" }
 enumn = { path = "../enumn" }
 fuse = {path = "../fuse" }
+getopts = "0.2"
 gpu_display = { path = "../gpu_display", optional = true }
 rutabaga_gfx = { path = "../rutabaga_gfx", optional = true }
 hypervisor = { path = "../hypervisor" }
@@ -72,3 +73,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "vhost_user_blk"
 path = "src/virtio/vhost/user/backend/block.rs"
+
+[[bin]]
+name = "vhost_user_net"
+path = "src/virtio/vhost/user/backend/net.rs"
