@@ -646,7 +646,15 @@ where
         mut queues: Vec<Queue>,
         mut queue_evts: Vec<Event>,
     ) {
-        if queues.len() != self.queue_sizes.len() || queue_evts.len() != self.queue_sizes.len() {
+        let enable_ctrlq = (self.acked_features & 1 << virtio_net::VIRTIO_NET_F_CTRL_VQ) != 0
+            && queues.len() % 2 == 1;
+
+        let expected_queues_num = if enable_ctrlq {
+            self.queue_sizes.len()
+        } else {
+            self.queue_sizes.len() - 1
+        };
+        if queues.len() != expected_queues_num || queue_evts.len() != expected_queues_num {
             error!(
                 "net: expected {} queues, got {}",
                 self.queue_sizes.len(),
@@ -675,10 +683,10 @@ where
             let interrupt = interrupt_arc.clone();
             let memory = mem.clone();
             let kill_evt = self.workers_kill_evt.remove(0);
-            // Queues alternate between rx0, tx0, rx1, tx1, ..., rxN, txN, ctrl.
+            // Queues alternate between rx0, tx0, rx1, tx1, ..., rxN, txN (, ctrl).
             let rx_queue = queues.remove(0);
             let tx_queue = queues.remove(0);
-            let ctrl_queue = if i == 0 {
+            let ctrl_queue = if i == 0 && enable_ctrlq {
                 Some(queues.remove(queues.len() - 1))
             } else {
                 None
@@ -686,7 +694,7 @@ where
             let pairs = vq_pairs as u16;
             let rx_queue_evt = queue_evts.remove(0);
             let tx_queue_evt = queue_evts.remove(0);
-            let ctrl_queue_evt = if i == 0 {
+            let ctrl_queue_evt = if i == 0 && enable_ctrlq {
                 Some(queue_evts.remove(queue_evts.len() - 1))
             } else {
                 None
