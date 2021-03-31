@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::mem::size_of;
 use std::rc::Rc;
 use std::result;
-use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
+use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::u32;
@@ -272,7 +272,7 @@ async fn process_one_request(
 }
 
 async fn process_one_request_task(
-    queue: Rc<RefCell<Queue>>,
+    queue: Arc<Mutex<Queue>>,
     avail_desc: DescriptorChain,
     disk_state: Rc<AsyncMutex<DiskState>>,
     mem: GuestMemory,
@@ -292,7 +292,7 @@ async fn process_one_request_task(
             }
         };
 
-    let mut queue = queue.borrow_mut();
+    let mut queue = queue.lock().expect("failed to get queue");
     queue.add_used(&mem, descriptor_index, len as u32);
     queue.trigger_interrupt(&mem, &**interrupt.borrow());
     queue.update_int_required(&mem);
@@ -305,7 +305,7 @@ async fn handle_queue(
     ex: &Executor,
     mem: &GuestMemory,
     disk_state: Rc<AsyncMutex<DiskState>>,
-    queue: Rc<RefCell<Queue>>,
+    queue: Arc<Mutex<Queue>>,
     evt: EventAsync,
     interrupt: Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>,
     flush_timer: Rc<RefCell<TimerAsync>>,
@@ -316,9 +316,9 @@ async fn handle_queue(
             error!("Failed to read the next queue event: {}", e);
             continue;
         }
-        while let Some(descriptor_chain) = queue.borrow_mut().pop(&mem) {
+        while let Some(descriptor_chain) = queue.lock().expect("failed to get queue").pop(&mem) {
             ex.spawn_local(process_one_request_task(
-                Rc::clone(&queue),
+                Arc::clone(&queue),
                 descriptor_chain,
                 Rc::clone(&disk_state),
                 mem.clone(),
@@ -469,7 +469,7 @@ async fn flush_disk(
 fn run_worker(
     ex: Executor,
     interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
-    queues: Vec<Queue>,
+    queues: Vec<Arc<Mutex<Queue>>>,
     mem: GuestMemory,
     disk_state: &Rc<AsyncMutex<DiskState>>,
     control_socket: &Option<DiskControlResponseSocket>,
@@ -512,7 +512,6 @@ fn run_worker(
     let queue_handlers =
         queues
             .into_iter()
-            .map(|q| Rc::new(RefCell::new(q)))
             .zip(queue_evts.into_iter().map(|e| {
                 EventAsync::new(e.0, &ex).expect("Failed to create async event for queue")
             }))
@@ -525,7 +524,7 @@ fn run_worker(
                     &ex,
                     mem,
                     Rc::clone(&disk_state),
-                    Rc::clone(&queue),
+                    Arc::clone(&queue),
                     event,
                     interrupt,
                     Rc::clone(&flush_timer),
@@ -863,6 +862,14 @@ impl VirtioDevice for BlockAsync {
         copy_config(data, 0, config_space.as_slice(), offset);
     }
 
+    fn queues_per_worker(&self) -> Vec<Vec<usize>> {
+        let mut ret = vec![];
+        for i in 0..NUM_QUEUES {
+            ret.push(vec![i as usize]);
+        }
+        ret
+    }
+
     fn activate(
         &mut self,
         mem: GuestMemory,
@@ -870,6 +877,10 @@ impl VirtioDevice for BlockAsync {
         queues: Vec<Queue>,
         queue_evts: Vec<Event>,
     ) {
+        let queues = queues
+            .into_iter()
+            .map(|q| Arc::new(Mutex::new(q)))
+            .collect();
         self.activate_vhost(mem, vec![Box::new(interrupt)], queues, queue_evts)
     }
 
@@ -877,7 +888,7 @@ impl VirtioDevice for BlockAsync {
         &mut self,
         mem: GuestMemory,
         interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
-        queues: Vec<Queue>,
+        queues: Vec<Arc<Mutex<Queue>>>,
         queue_evts: Vec<Event>,
     ) {
         let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {

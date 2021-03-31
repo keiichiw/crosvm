@@ -40,10 +40,6 @@ impl NetBackend {
 }
 
 impl VhostUserBackend for NetBackend {
-    fn expected_queue_num(&self) -> usize {
-        2
-    }
-
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         let mut features = VhostUserProtocolFeatures::all();
         features.remove(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS);

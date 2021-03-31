@@ -1,11 +1,11 @@
 use std::os::unix::io::RawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use vmm_vhost::vhost_user::message::*;
 use vmm_vhost::vhost_user::*;
 
 use base::{
-    Event, FromRawDescriptor, RawDescriptor, SafeDescriptor, SharedMemory, SharedMemoryUnix,
+    error, Event, FromRawDescriptor, RawDescriptor, SafeDescriptor, SharedMemory, SharedMemoryUnix,
 };
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
@@ -41,12 +41,6 @@ impl SignalableInterrupt for CallEvent {
     fn do_interrupt_resample(&self) {}
 }
 
-struct QueueInfo {
-    desc_table: GuestAddress,
-    avail_ring: GuestAddress,
-    used_ring: GuestAddress,
-}
-
 /// Keeps a mpaaing from the vmm's virtual addresses to guest addresses.
 /// used to translate messages from the vmm to guest offsets.
 #[derive(Default)]
@@ -71,22 +65,17 @@ struct MemInfo {
 }
 
 pub trait VhostUserBackend {
-    /// Returns the number or queues that the vmm is expected to send.
-    ///
-    /// FIXME(keiichiw): this must be fixed because the device cannot know how many queues the vmm
-    /// will use in total. Instead, we should allow to activate devices with uninitialized Queues
-    /// and set up them later.
-    fn expected_queue_num(&self) -> usize;
-
-    /// TODO(keiichiw): This method will allow `set_vring_*` to set up a `Queue` after the device is activated.
-    // fn queue_mut(&mut self, index: usize) -> &mut Queue;
-
     fn protocol_features(&self) -> VhostUserProtocolFeatures;
     fn ack_protocol_features(&mut self, _value: u64);
     fn acked_protocol_features(&self) -> u64;
     fn reset(&mut self);
+
     fn device(&self) -> &dyn VirtioDevice;
     fn device_mut(&mut self) -> &mut dyn VirtioDevice;
+
+    fn queues_per_worker(&self) -> Vec<Vec<usize>> {
+        self.device().queues_per_worker()
+    }
 
     fn features(&self) -> u64 {
         self.device().features()
@@ -108,11 +97,42 @@ pub trait VhostUserBackend {
         &mut self,
         mem: GuestMemory,
         interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
-        queues: Vec<Queue>,
+        queues: Vec<Arc<Mutex<Queue>>>,
         queue_evts: Vec<Event>,
     ) {
         self.device_mut()
             .activate_vhost(mem, interrupts, queues, queue_evts)
+    }
+}
+
+pub struct Vring {
+    queue: Arc<Mutex<Queue>>,
+    call_fd: Option<Event>,
+    kick_fd: Option<Event>,
+    enabled: bool,
+
+    /// Whether a backend is activated with the queue.
+    activated: bool,
+}
+
+impl Vring {
+    fn new(max_size: u16) -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(Queue::new(max_size))),
+            call_fd: None,
+            kick_fd: None,
+            enabled: false,
+            activated: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        let mut queue = self.queue.lock().expect("failed to get queue");
+        queue.reset();
+        self.call_fd = None;
+        self.kick_fd = None;
+        self.enabled = false;
+        self.activated = false;
     }
 }
 
@@ -122,110 +142,94 @@ pub struct VhostUserDeviceReqHandler<B: VhostUserBackend> {
     pub queue_num: usize,
     pub vring_num: [u32; MAX_QUEUE_NUM],
     pub vring_base: [u32; MAX_QUEUE_NUM],
-    queue_info: [Option<QueueInfo>; MAX_QUEUE_NUM],
-    pub call_fd: [Option<Event>; MAX_QUEUE_NUM],
-    pub kick_fd: [Option<Event>; MAX_QUEUE_NUM],
     pub err_fd: [Option<Event>; MAX_QUEUE_NUM],
-    pub vring_started: [bool; MAX_QUEUE_NUM],
-    pub vring_enabled: [bool; MAX_QUEUE_NUM],
     vu_req: Option<SlaveFsCacheReq>,
     mem: Option<MemInfo>,
+    vrings: Vec<Vring>,
     backend: B,
 }
 
 impl<B: VhostUserBackend> VhostUserDeviceReqHandler<B> {
     pub fn new(backend: B) -> Self {
+        let mut vrings = Vec::with_capacity(MAX_QUEUE_NUM as usize);
+        for _ in 0..MAX_QUEUE_NUM {
+            vrings.push(Vring::new(MAX_VRING_NUM as u16));
+        }
+
         VhostUserDeviceReqHandler {
             owned: false,
             features_acked: false,
             queue_num: MAX_QUEUE_NUM,
             vring_num: [0; MAX_QUEUE_NUM],
             vring_base: [0; MAX_QUEUE_NUM],
-            queue_info: Default::default(),
-            call_fd: Default::default(),
-            kick_fd: Default::default(),
             err_fd: Default::default(),
-            vring_started: [false; MAX_QUEUE_NUM],
-            vring_enabled: [false; MAX_QUEUE_NUM],
             vu_req: None,
             mem: None,
+            vrings,
             backend,
         }
     }
 
-    fn potentially_start_dev(&mut self) {
-        let num_queues = self.queue_info.iter().filter(|o| o.is_some()).count();
-        // HACK(keiichiw)
-        if num_queues < self.backend.expected_queue_num() {
-            return;
-        }
-        if self.kick_fd.iter().filter(|o| o.is_some()).count() < num_queues {
-            println!(
-                "no kicks {} {}",
-                self.kick_fd.iter().filter(|o| o.is_some()).count(),
-                self.queue_num
-            );
-            return;
-        }
-        if self.call_fd.iter().filter(|o| o.is_some()).count() < num_queues {
-            println!(
-                "no call {} {}",
-                self.call_fd.iter().filter(|o| o.is_some()).count(),
-                self.queue_num
-            );
+    fn potentially_start_dev(&mut self, index: usize) {
+        if self.vrings[index].activated {
             return;
         }
 
-        for i in 0..num_queues {
-            println!("keiichiw: vring_enabled[{}]={}", i, self.vring_enabled[i]);
+        let qs_per_worker = self.backend.queues_per_worker();
+
+        let queues = if let Some(qs) = qs_per_worker
+            .iter()
+            .find(|qs| qs.iter().find(|q| **q == index).is_some())
+        {
+            qs
+        } else {
+            return;
+        };
+
+        for q_index in queues {
+            if self.vrings[*q_index].call_fd.is_none()
+                || self.vrings[*q_index].kick_fd.is_none()
+                || !self.vrings[*q_index].enabled
+            {
+                return;
+            }
         }
 
-        println!("-------- start dev");
-        self.start_dev();
+        self.activate(&queues);
     }
 
-    fn start_dev(&mut self) {
-        let call_events = self
-            .call_fd
-            .iter_mut()
-            .filter(|o| o.is_some())
-            .map(|io| Box::<CallEvent>::new(CallEvent(io.take().unwrap())))
-            .map(|b| Box::<dyn SignalableInterrupt + Send>::from(b))
-            .collect();
-        let queues = self
-            .queue_info
+    fn activate(&mut self, queue_indexes: &[usize]) {
+        let call_events = queue_indexes
             .iter()
-            .filter(|o| o.is_some())
-            .zip(self.vring_num.iter())
-            .map(|(o, n)| {
-                let qi = o.as_ref().unwrap();
-                let mut queue = Queue::new(*n as u16);
-                queue.desc_table = qi.desc_table;
-                queue.avail_ring = qi.avail_ring;
-                queue.used_ring = qi.used_ring;
-                queue.ready = true;
-                queue
-            })
+            .map(|index| self.vrings[*index].call_fd.take().expect("call_fd"))
+            .map(|call_fd| Box::<CallEvent>::new(CallEvent(call_fd)))
+            .map(|call_event| Box::<dyn SignalableInterrupt + Send>::from(call_event))
+            .collect::<Vec<_>>();
+        let kick_fds = queue_indexes
+            .iter()
+            .map(|index| self.vrings[*index].kick_fd.take().expect("kick_fd"))
             .collect();
-        let eventfds = self
-            .kick_fd
-            .iter_mut()
-            .filter(|o| o.is_some())
-            .map(|event| event.take().unwrap())
+        let queues = queue_indexes
+            .iter()
+            .map(|index| self.vrings[*index].queue.clone())
             .collect();
-        self.backend.reset();
+
         self.backend.activate_vhost(
             self.mem.as_ref().unwrap().guest_mem.clone(),
             call_events,
             queues,
-            eventfds,
+            kick_fds,
         );
+
+        for index in queue_indexes {
+            self.vrings[*index].activated = true;
+        }
     }
 }
 
 impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHandler<B> {
     fn set_owner(&mut self) -> Result<()> {
-        println!("set_owner");
+        error!("set_owner");
         if self.owned {
             return Err(Error::InvalidOperation);
         }
@@ -269,8 +273,8 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHand
         // been disabled by VHOST_USER_SET_VRING_ENABLE with parameter 0.
         let vring_enabled =
             self.backend.acked_features() & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0;
-        for enabled in &mut self.vring_enabled {
-            *enabled = vring_enabled;
+        for v in &mut self.vrings {
+            v.enabled = vring_enabled;
         }
 
         Ok(())
@@ -362,12 +366,13 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHand
             return Err(Error::InvalidParam);
         }
         if let Some(mem) = &self.mem {
-            let queue = QueueInfo {
-                desc_table: GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap()),
-                avail_ring: GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, available).unwrap()),
-                used_ring: GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, used).unwrap()),
-            };
-            self.queue_info[index as usize] = Some(queue);
+            let mut queue = self.vrings[index as usize]
+                .queue
+                .lock()
+                .expect("failed to get queue");
+            queue.desc_table = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, descriptor).unwrap());
+            queue.avail_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, available).unwrap());
+            queue.used_ring = GuestAddress(vmm_va_to_gpa(&mem.vmm_maps, used).unwrap());
             return Ok(());
         }
         return Err(Error::InvalidParam);
@@ -392,16 +397,10 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHand
         // that file descriptor is readable) on the descriptor specified by
         // VHOST_USER_SET_VRING_KICK, and stop ring upon receiving
         // VHOST_USER_GET_VRING_BASE.
-        self.vring_started[index as usize] = false;
-        for c in self.call_fd.iter_mut() {
-            *c = None;
+        for v in self.vrings.iter_mut() {
+            v.reset();
         }
-        for c in self.kick_fd.iter_mut() {
-            *c = None;
-        }
-        for c in self.queue_info.iter_mut() {
-            *c = None;
-        }
+
         Ok(VhostUserVringState::new(
             index,
             self.vring_base[index as usize],
@@ -415,7 +414,7 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHand
         }
         unsafe {
             // Safe because the FD is now owned.
-            self.kick_fd[index as usize] = fd.map(|fd| Event::from_raw_descriptor(fd));
+            self.vrings[index as usize].kick_fd = fd.map(|fd| Event::from_raw_descriptor(fd));
         }
 
         // Quotation from vhost-user spec:
@@ -425,9 +424,15 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHand
         // VHOST_USER_GET_VRING_BASE.
         //
         // So we should add fd to event monitor(select, poll, epoll) here.
-        self.vring_started[index as usize] = true;
+        {
+            let mut queue = self.vrings[index as usize]
+                .queue
+                .lock()
+                .expect("failed to get queue");
+            queue.ready = true;
+        }
         // TODO:dgreid - call activate here? or wait until both kick,call,and err have been set?
-        self.potentially_start_dev();
+        self.potentially_start_dev(index as usize);
         Ok(())
     }
 
@@ -438,9 +443,9 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHand
         }
         unsafe {
             // Safe because the FD is now owned.
-            self.call_fd[index as usize] = fd.map(|fd| Event::from_raw_descriptor(fd));
+            self.vrings[index as usize].call_fd = fd.map(|fd| Event::from_raw_descriptor(fd));
         }
-        self.potentially_start_dev();
+        self.potentially_start_dev(index as usize);
         Ok(())
     }
 
@@ -470,8 +475,8 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for VhostUserDeviceReqHand
         // enabled by VHOST_USER_SET_VRING_ENABLE with parameter 1,
         // or after it has been disabled by VHOST_USER_SET_VRING_ENABLE
         // with parameter 0.
-        self.vring_enabled[index as usize] = enable;
-        self.potentially_start_dev();
+        self.vrings[index as usize].enabled = enable;
+        self.potentially_start_dev(index as usize);
         Ok(())
     }
 

@@ -8,6 +8,7 @@ use std::mem;
 use std::net::Ipv4Addr;
 use std::os::raw::c_uint;
 use std::result;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use base::Error as SysError;
@@ -147,9 +148,9 @@ unsafe impl DataInit for VirtioNetConfig {}
 struct Worker<T: TapT> {
     interrupt: Box<dyn SignalableInterrupt + Send>,
     mem: GuestMemory,
-    rx_queue: Queue,
-    tx_queue: Queue,
-    ctrl_queue: Option<Queue>,
+    rx_queue: Arc<Mutex<Queue>>,
+    tx_queue: Arc<Mutex<Queue>>,
+    ctrl_queue: Option<Arc<Mutex<Queue>>>,
     tap: T,
     acked_features: u64,
     vq_pairs: u16,
@@ -166,7 +167,8 @@ where
 
         // Read as many frames as possible.
         loop {
-            let desc_chain = match self.rx_queue.peek(&self.mem) {
+            let mut rx_queue = self.rx_queue.lock().expect("failed to get rx_queue");
+            let desc_chain = match rx_queue.peek(&self.mem) {
                 Some(desc) => desc,
                 None => {
                     exhausted_queue = true;
@@ -202,14 +204,15 @@ where
             };
 
             if bytes_written > 0 {
-                self.rx_queue.pop_peeked(&self.mem);
-                self.rx_queue.add_used(&self.mem, index, bytes_written);
+                rx_queue.pop_peeked(&self.mem);
+                rx_queue.add_used(&self.mem, index, bytes_written);
                 needs_interrupt = true;
             }
         }
 
         if needs_interrupt {
-            self.interrupt.signal_used_queue(self.rx_queue.vector);
+            let rx_queue = self.rx_queue.lock().expect("failed to get rx_queue");
+            self.interrupt.signal_used_queue(rx_queue.vector);
         }
 
         if exhausted_queue {
@@ -220,7 +223,14 @@ where
     }
 
     fn process_tx(&mut self) {
-        while let Some(desc_chain) = self.tx_queue.pop(&self.mem) {
+        loop {
+            let mut tx_queue = self.tx_queue.lock().expect("failed to get ctrl_queue");
+            let desc_chain = if let Some(desc_chain) = tx_queue.pop(&self.mem) {
+                desc_chain
+            } else {
+                break;
+            };
+
             let index = desc_chain.index;
 
             match Reader::new(self.mem.clone(), desc_chain) {
@@ -243,10 +253,11 @@ where
                 Err(e) => error!("net: failed to create Reader: {}", e),
             }
 
-            self.tx_queue.add_used(&self.mem, index, 0);
+            tx_queue.add_used(&self.mem, index, 0);
         }
 
-        self.interrupt.signal_used_queue(self.tx_queue.vector);
+        self.interrupt
+            .signal_used_queue(self.tx_queue.lock().expect("failed to get tx_queue").vector);
     }
 
     fn process_ctrl(&mut self) -> Result<(), NetError> {
@@ -255,7 +266,13 @@ where
             None => return Ok(()),
         };
 
-        while let Some(desc_chain) = ctrl_queue.pop(&self.mem) {
+        loop {
+            let mut ctrl_queue = ctrl_queue.lock().expect("failed to get ctrl_queue");
+            let desc_chain = if let Some(desc_chain) = ctrl_queue.pop(&self.mem) {
+                desc_chain
+            } else {
+                break;
+            };
             let index = desc_chain.index;
 
             let mut reader = Reader::new(self.mem.clone(), desc_chain.clone())
@@ -312,7 +329,8 @@ where
             ctrl_queue.add_used(&self.mem, index, 0);
         }
 
-        self.interrupt.signal_used_queue(ctrl_queue.vector);
+        self.interrupt
+            .signal_used_queue(ctrl_queue.lock().expect("failed to get ctrl_queue").vector);
         Ok(())
     }
 
@@ -642,38 +660,11 @@ where
         copy_config(data, 0, config_space.as_slice(), offset);
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemory,
-        interrupt: Interrupt,
-        queues: Vec<Queue>,
-        queue_evts: Vec<Event>,
-    ) {
-        let enable_ctrlq = (self.acked_features & 1 << virtio_net::VIRTIO_NET_F_CTRL_VQ) != 0
-            && queues.len() % 2 == 1;
-
-        let expected_queues_num = if enable_ctrlq {
-            self.queue_sizes.len()
-        } else {
-            self.queue_sizes.len() - 1
-        };
-        if queues.len() != expected_queues_num || queue_evts.len() != expected_queues_num {
-            error!(
-                "net: expected {} queues, got {}",
-                self.queue_sizes.len(),
-                queues.len()
-            );
-            return;
-        }
-
-        self.activate_vhost(mem, vec![Box::new(interrupt)], queues, queue_evts)
-    }
-
     fn activate_vhost(
         &mut self,
         mem: GuestMemory,
         mut interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
-        mut queues: Vec<Queue>,
+        mut queues: Vec<Arc<Mutex<Queue>>>,
         mut queue_evts: Vec<Event>,
     ) {
         println!(
@@ -756,6 +747,60 @@ where
                 Ok(join_handle) => self.worker_threads.push(join_handle),
             }
         }
+    }
+
+    fn queues_per_worker(&self) -> Vec<Vec<usize>> {
+        let queues_num = self.queue_sizes.len();
+
+        let mut ret = vec![];
+        ret.push(vec![0, 1]);
+        if (self.acked_features & 1 << virtio_net::VIRTIO_NET_F_CTRL_VQ) != 0 {
+            // ctrlq
+            ret[0].push(2);
+        }
+
+        if (self.acked_features & 1 << virtio_net::VIRTIO_NET_F_MQ) == 0 {
+            // Support only one pair of tx/rx.
+            return ret;
+        }
+
+        let base = ret[0][ret[0].len() - 1] + 1;
+        for i in (base..queues_num).step_by(2) {
+            ret.push(vec![i, i + 1]);
+        }
+
+        ret
+    }
+
+    fn activate(
+        &mut self,
+        mem: GuestMemory,
+        interrupt: Interrupt,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
+    ) {
+        let enable_ctrlq = (self.acked_features & 1 << virtio_net::VIRTIO_NET_F_CTRL_VQ) != 0
+            && queues.len() % 2 == 1;
+
+        let expected_queues_num = if enable_ctrlq {
+            self.queue_sizes.len()
+        } else {
+            self.queue_sizes.len() - 1
+        };
+        if queues.len() != expected_queues_num || queue_evts.len() != expected_queues_num {
+            error!(
+                "net: expected {} queues, got {}",
+                self.queue_sizes.len(),
+                queues.len()
+            );
+            return;
+        }
+
+        let queues = queues
+            .into_iter()
+            .map(|q| Arc::new(Mutex::new(q)))
+            .collect();
+        self.activate_vhost(mem, vec![Box::new(interrupt)], queues, queue_evts)
     }
 
     fn reset(&mut self) -> bool {

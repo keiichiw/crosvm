@@ -5,9 +5,9 @@
 pub mod handler;
 
 use std::fs::OpenOptions;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use devices::virtio::{base_features, BlockAsync, VirtioDevice};
+use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
 use devices::ProtectionType;
 use disk::ToAsyncDisk;
 use getopts::Options;
@@ -16,7 +16,7 @@ use vm_control::DiskControlResponseSocket;
 use vmm_vhost::vhost_user::message::*;
 use vmm_vhost::vhost_user::*;
 
-use crate::handler::VhostUserBackend;
+use crate::handler::{VhostUserBackend, MAX_QUEUE_NUM, MAX_VRING_NUM};
 
 struct BlockBackend {
     device: BlockAsync,
@@ -50,10 +50,6 @@ impl BlockBackend {
 }
 
 impl VhostUserBackend for BlockBackend {
-    fn expected_queue_num(&self) -> usize {
-        1
-    }
-
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         let mut features = VhostUserProtocolFeatures::all();
         features.remove(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS);

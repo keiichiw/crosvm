@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::sync::{Arc, Mutex};
+
 use base::{Event, RawDescriptor};
 use vm_memory::GuestMemory;
 
@@ -70,13 +72,19 @@ pub trait VirtioDevice: Send {
         queue_evts: Vec<Event>,
     );
 
+    // TODO(keiichiw): rename to `activate_worker`?
     fn activate_vhost(
         &mut self,
-        mem: GuestMemory,
-        interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
-        queues: Vec<Queue>,
-        queue_evts: Vec<Event>,
+        _mem: GuestMemory,
+        _interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
+        _queues: Vec<Arc<Mutex<Queue>>>,
+        _queue_evts: Vec<Event>,
     ) {
+        unimplemented!("activate_vhost");
+    }
+
+    fn queues_per_worker(&self) -> Vec<Vec<usize>> {
+        unimplemented!("queues_per_worker");
     }
 
     /// Optionally deactivates this device. If the reset method is
