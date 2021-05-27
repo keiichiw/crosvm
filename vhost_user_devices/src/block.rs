@@ -13,69 +13,20 @@ use vmm_vhost::vhost_user::*;
 use base::{
     Event, FromRawDescriptor, RawDescriptor, SafeDescriptor, SharedMemory, SharedMemoryUnix,
 };
-use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
-
 use devices::virtio::SignalableInterrupt;
 use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
 use devices::ProtectionType;
+use vhost_user_devices::{CallEvent, DeviceRequestHandler, VhostUserBackend};
+use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
 pub const VIRTIO_TRANSPORT_FEATURES: u64 = 0x1_4000_0000;
 
-struct CallEvent(Event);
-
-impl SignalableInterrupt for CallEvent {
-    /// Writes to the irqfd to VMM to deliver virtual interrupt to the guest.
-    fn signal(&self, _vector: u16, interrupt_status_mask: u32) {
-        self.0.write(interrupt_status_mask as u64).unwrap();
-    }
-
-    /// Notify the driver that buffers have been placed in the used queue.
-    fn signal_used_queue(&self, vector: u16) {
-        self.signal(vector, 0 /*INTERRUPT_STATUS_USED_RING*/)
-    }
-
-    /// Notify the driver that the device configuration has changed.
-    fn signal_config_changed(&self) {} // TODO(dgreid)
-
-    /// Get the event to signal resampling is needed if it exists.
-    fn get_resample_evt(&self) -> Option<&Event> {
-        None
-    }
-
-    /// Reads the status and writes to the interrupt event. Doesn't read the resample event, it
-    /// assumes the resample has been requested.
-    fn do_interrupt_resample(&self) {}
-}
-
-struct QueueInfo {
-    desc_table: GuestAddress,
-    avail_ring: GuestAddress,
-    used_ring: GuestAddress,
-}
-
-/// Keeps a mpaaing from the vmm's virtual addresses to guest addresses.
-/// used to translate messages from the vmm to guest offsets.
-#[derive(Default)]
-struct MappingInfo {
-    vmm_addr: u64,
-    guest_phys: u64,
-    size: u64,
-}
-
-fn vmm_va_to_gpa(maps: &Vec<MappingInfo>, vmm_va: u64) -> Result<u64> {
-    for map in maps {
-        if vmm_va >= map.vmm_addr && vmm_va < map.vmm_addr + map.size {
-            return Ok(vmm_va - map.vmm_addr + map.guest_phys);
-        }
-    }
-    Err(Error::InvalidMessage)
-}
-
-struct MemInfo {
-    guest_mem: GuestMemory,
-    vmm_maps: Vec<MappingInfo>,
+pub struct BlockBackend {
+    avail_features: u64,
+    acked_features: u64,
+    acked_protocol_features: VhostUserProtocolFeatures,
 }
 
 pub struct BlockSlaveReqHandler {
@@ -98,13 +49,22 @@ pub struct BlockSlaveReqHandler {
 }
 
 impl BlockSlaveReqHandler {
-    pub fn new<P: AsRef<Path>>(filename: P) -> Self {
+    pub fn new<P: AsRef<Path>>(filename: P, read_only: bool) -> Self {
         let f = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(!read_only)
             .create(false)
             .open(filename)
             .unwrap();
+        let disk_image = Box::new(f.to_async_disk(&ex).unwrap()); //TODO unwrap
+        let disk_state = DiskState {
+            disk_image,
+            disk_size,
+            read_only,
+            sparse,
+            id,
+        };
+
         let block = BlockAsync::new(
             base_features(ProtectionType::Unprotected),
             Box::new(f),
