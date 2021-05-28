@@ -5,7 +5,7 @@ authors = ["The Chromium OS Authors"]
 edition = "2018"
 
 [features]
-net = ["data_model", "getopts", "net_util", "virtio_sys"]
+net = ["data_model", "net_util", "virtio_sys"]
 
 [lib]
 path = "src/lib.rs"
@@ -25,7 +25,8 @@ base = { path = "../base" }
 cros_async = { path = "../cros_async" }
 data_model = { path = "../data_model", optional = true }
 devices = { path = "../devices" }
-getopts = { version = "0.2", optional = true }
+disk = { path = "../disk" }
+getopts = { version = "0.2" }
 libc = "*"
 net_util = { path = "../net_util", optional = true }
 once_cell = "1.7.2"

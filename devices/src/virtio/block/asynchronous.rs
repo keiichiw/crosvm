@@ -127,12 +127,32 @@ enum OtherError {
     ReadResampleEvent(AsyncError),
 }
 
-struct DiskState {
-    disk_image: Box<dyn AsyncDisk>,
-    disk_size: Arc<AtomicU64>,
-    read_only: bool,
-    sparse: bool,
-    id: Option<BlockId>,
+/// Tracks the state of an anynchronous disk.
+pub struct DiskState {
+    pub disk_image: Box<dyn AsyncDisk>,
+    pub disk_size: Arc<AtomicU64>,
+    pub read_only: bool,
+    pub sparse: bool,
+    pub id: Option<BlockId>,
+}
+
+impl DiskState {
+    /// Creates a `DiskState` with the given params.
+    pub fn new(
+        disk_image: Box<dyn AsyncDisk>,
+        disk_size: Arc<AtomicU64>,
+        read_only: bool,
+        sparse: bool,
+        id: Option<BlockId>,
+    ) -> DiskState {
+        DiskState {
+            disk_image,
+            disk_size,
+            read_only,
+            sparse,
+            id,
+        }
+    }
 }
 
 async fn process_one_request(
