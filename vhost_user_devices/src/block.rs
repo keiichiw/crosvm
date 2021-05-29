@@ -19,15 +19,16 @@ use vmm_vhost::vhost_user::SlaveListener;
 use vmm_vhost::vhost_user::*;
 
 use base::{
-    error, warn, Event, FromRawDescriptor, RawDescriptor, SafeDescriptor, SharedMemory,
-    SharedMemoryUnix,
+    error, iov_max, warn, Event, FromRawDescriptor, RawDescriptor, SafeDescriptor, SharedMemory,
+    SharedMemoryUnix, Timer,
 };
 use cros_async::{
     select5, sync::Mutex as AsyncMutex, AsyncError, EventAsync, Executor, IoSourceExt,
     SelectResult, TimerAsync,
 };
+use data_model::DataInit;
 use devices::virtio;
-use devices::virtio::block::{BlockId, DiskState, SECTOR_SIZE};
+use devices::virtio::block::*;
 use devices::virtio::SignalableInterrupt;
 use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
 use devices::ProtectionType;
@@ -39,7 +40,9 @@ static BLOCK_EXECUTOR: OnceCell<Executor> = OnceCell::new();
 
 pub struct BlockBackend {
     disk_state: Rc<AsyncMutex<DiskState>>,
+    disk_size: Arc<AtomicU64>,
     block_size: u32,
+    seg_max: u32,
     avail_features: u64,
     acked_features: u64,
     acked_protocol_features: VhostUserProtocolFeatures,
@@ -79,13 +82,18 @@ impl BlockBackend {
         // Since we do not currently support indirect descriptors, the maximum
         // number of segments must be smaller than the queue size.
         // In addition, the request header and status each consume a descriptor.
-        let seg_max = min(seg_max, u32::from(QUEUE_SIZE) - 2);
+        let seg_max = min(seg_max, u32::from(self::QUEUE_SIZE) - 2);
+
+        // Safe because the executor is initialized in main() below.
+        let ex = BLOCK_EXECUTOR.get().expect("Executor not initialized");
 
         let async_image = disk_image.to_async_disk(&ex).unwrap();
 
+        let disk_size = Arc::new(AtomicU64::new(disk_size));
+
         let disk_state = Rc::new(AsyncMutex::new(DiskState::new(
             async_image,
-            Arc::new(AtomicU64::new(disk_size)),
+            Arc::clone(&disk_size),
             read_only,
             sparse,
             id,
@@ -104,7 +112,9 @@ impl BlockBackend {
 
         BlockBackend {
             disk_state,
+            disk_size,
             block_size,
+            seg_max,
             avail_features,
             acked_features: 0,
             acked_protocol_features: VhostUserProtocolFeatures::empty(),
@@ -157,15 +167,10 @@ impl VhostUserBackend for BlockBackend {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        println!("read_config, {} {}", offset, size);
+        println!("read_config, {} {}", offset, data.len());
         let config_space = {
-            let disk_size = self.disk_state.disk_size.load(Ordering::Relaxed);
-            build_config_space(
-                disk_size,
-                self.disk_state.seg_max,
-                self.block_size,
-                NUM_QUEUES,
-            )
+            let disk_size = self.disk_size.load(Ordering::Relaxed);
+            build_config_space(disk_size, self.seg_max, self.block_size, NUM_QUEUES)
         };
         copy_config(data, 0, config_space.as_slice(), offset);
     }

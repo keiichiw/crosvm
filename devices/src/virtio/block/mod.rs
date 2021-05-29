@@ -8,4 +8,4 @@ pub(crate) mod common;
 
 pub use asynchronous::{BlockAsync, DiskState};
 pub use block::Block;
-pub use common::{build_avail_features, BlockId, SECTOR_SIZE};
+pub use common::*;

@@ -6,6 +6,7 @@ edition = "2018"
 
 [features]
 net = ["data_model", "net_util", "virtio_sys"]
+block = ["data_model"]
 
 [lib]
 path = "src/lib.rs"
@@ -18,6 +19,7 @@ required-features = ["net"]
 [[bin]]
 name = "vhost-user-block-device"
 path = "src/block.rs"
+required-features = ["block"]
 
 [dependencies]
 anyhow = "*"
