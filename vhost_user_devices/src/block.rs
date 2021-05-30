@@ -4,8 +4,6 @@
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::fs::OpenOptions;
-use std::os::unix::io::RawFd;
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
 
@@ -15,27 +13,19 @@ use getopts::Options;
 use once_cell::sync::OnceCell;
 
 use vmm_vhost::vhost_user::message::*;
-use vmm_vhost::vhost_user::SlaveListener;
-use vmm_vhost::vhost_user::*;
 
-use base::{
-    error, iov_max, warn, Event, FromRawDescriptor, RawDescriptor, SafeDescriptor, SharedMemory,
-    SharedMemoryUnix, Timer,
-};
-use cros_async::{
-    select5, sync::Mutex as AsyncMutex, AsyncError, EventAsync, Executor, IoSourceExt,
-    SelectResult, TimerAsync,
-};
+use base::{error, iov_max, warn, Event, Timer};
+use cros_async::{sync::Mutex as AsyncMutex, EventAsync, Executor, TimerAsync};
 use data_model::DataInit;
 use devices::virtio;
 use devices::virtio::block::asynchronous::process_one_request_task;
 use devices::virtio::block::*;
 use devices::virtio::SignalableInterrupt;
-use devices::virtio::{base_features, copy_config, BlockAsync, Queue, VirtioDevice};
+use devices::virtio::{base_features, copy_config, Queue};
 use devices::ProtectionType;
-use disk::{create_async_disk_file, AsyncDisk, ToAsyncDisk};
+use disk::{create_async_disk_file, ToAsyncDisk};
 use vhost_user_devices::{CallEvent, DeviceRequestHandler, VhostUserBackend};
-use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
+use vm_memory::GuestMemory;
 
 static BLOCK_EXECUTOR: OnceCell<Executor> = OnceCell::new();
 
@@ -192,6 +182,7 @@ impl VhostUserBackend for BlockBackend {
         call_evt: CallEvent,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
+        println!("start queue: {}", idx);
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
             warn!("Starting new queue handler without stopping old handler");
             handle.abort();
