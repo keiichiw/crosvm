@@ -295,7 +295,7 @@ fn main() -> anyhow::Result<()> {
     // We can unwrap after `opt_str()` safely because they are required options.
     let socket = matches.opt_str("socket").unwrap();
     let filename = matches.opt_str("file").unwrap();
-    let read_only = matches.opt_present("file");
+    let read_only = matches.opt_present("read-only");
     let sparse = true;
     let block_size = 512;
     let f = OpenOptions::new()
