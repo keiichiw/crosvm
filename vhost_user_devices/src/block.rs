@@ -79,7 +79,8 @@ impl BlockBackend {
             );
         }
 
-        let avail_features = build_avail_features(base_features, read_only, sparse, true);
+        let avail_features =
+            build_avail_features(base_features, read_only, sparse, true) | 0x4000_0000; // TODO why the extra 40000000? what is bit 30?
 
         let seg_max = min(max(iov_max(), 1), u32::max_value() as usize) as u32;
 
