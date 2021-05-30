@@ -197,7 +197,7 @@ async fn process_one_request(
     Ok(available_bytes)
 }
 
-async fn process_one_request_task(
+pub async fn process_one_request_task(
     queue: Rc<RefCell<Queue>>,
     avail_desc: DescriptorChain,
     disk_state: Rc<AsyncMutex<DiskState>>,

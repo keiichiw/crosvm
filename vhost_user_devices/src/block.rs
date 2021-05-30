@@ -28,15 +28,19 @@ use cros_async::{
 };
 use data_model::DataInit;
 use devices::virtio;
+use devices::virtio::block::asynchronous::process_one_request_task;
 use devices::virtio::block::*;
 use devices::virtio::SignalableInterrupt;
-use devices::virtio::{base_features, BlockAsync, Queue, VirtioDevice};
+use devices::virtio::{base_features, copy_config, BlockAsync, Queue, VirtioDevice};
 use devices::ProtectionType;
 use disk::{create_async_disk_file, AsyncDisk, ToAsyncDisk};
 use vhost_user_devices::{CallEvent, DeviceRequestHandler, VhostUserBackend};
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 
 static BLOCK_EXECUTOR: OnceCell<Executor> = OnceCell::new();
+
+const QUEUE_SIZE: u16 = 256;
+const NUM_QUEUES: u16 = 16;
 
 pub struct BlockBackend {
     disk_state: Rc<AsyncMutex<DiskState>>,
@@ -82,7 +86,7 @@ impl BlockBackend {
         // Since we do not currently support indirect descriptors, the maximum
         // number of segments must be smaller than the queue size.
         // In addition, the request header and status each consume a descriptor.
-        let seg_max = min(seg_max, u32::from(self::QUEUE_SIZE) - 2);
+        let seg_max = min(seg_max, u32::from(QUEUE_SIZE) - 2);
 
         // Safe because the executor is initialized in main() below.
         let ex = BLOCK_EXECUTOR.get().expect("Executor not initialized");
@@ -120,14 +124,14 @@ impl BlockBackend {
             acked_protocol_features: VhostUserProtocolFeatures::empty(),
             flush_timer,
             flush_timer_armed,
-            workers: [None; Self::MAX_QUEUE_NUM],
+            workers: Default::default(),
         }
     }
 }
 
 impl VhostUserBackend for BlockBackend {
-    const MAX_QUEUE_NUM: usize = 16;
-    const MAX_VRING_LEN: u16 = 256;
+    const MAX_QUEUE_NUM: usize = NUM_QUEUES as usize;
+    const MAX_VRING_LEN: u16 = QUEUE_SIZE;
 
     type Error = anyhow::Error;
 
@@ -208,7 +212,7 @@ impl VhostUserBackend for BlockBackend {
                 disk_state,
                 Rc::new(RefCell::new(queue)),
                 kick_evt,
-                Rc::new(RefCell::new(call_event)),
+                Rc::new(RefCell::new(Box::new(call_evt))),
                 timer,
                 timer_armed,
             ),
@@ -244,6 +248,8 @@ async fn handle_queue(
             error!("Failed to read the next queue event: {}", e);
             continue;
         }
+        // Safe because the executor is initialized in main() below.
+        let ex = BLOCK_EXECUTOR.get().expect("Executor not initialized");
         while let Some(descriptor_chain) = queue.borrow_mut().pop(&mem) {
             ex.spawn_local(process_one_request_task(
                 Rc::clone(&queue),
@@ -261,9 +267,9 @@ async fn handle_queue(
 
 fn main() -> anyhow::Result<()> {
     let mut opts = Options::new();
-    opts.reqopt("f", "file", "path to the disk file", "PATH");
+    opts.reqopt("", "file", "path to the disk file", "PATH");
     opts.optflag("h", "help", "print this help menu");
-    opts.optflag("ro", "read-only", "expose disk as read only");
+    opts.optflag("", "read-only", "expose disk as read only");
     opts.reqopt("", "socket", "path to a socket", "PATH");
 
     let mut args = std::env::args();
@@ -291,19 +297,20 @@ fn main() -> anyhow::Result<()> {
     let filename = matches.opt_str("file").unwrap();
     let read_only = matches.opt_present("file");
     let sparse = true;
+    let block_size = 512;
     let f = OpenOptions::new()
         .read(true)
         .write(!read_only)
         .create(false)
         .open(filename)
         .unwrap();
-    let async_file = Box::new(create_async_disk_file(f).unwrap());
+    let async_file = create_async_disk_file(f).unwrap();
 
     let _ = BLOCK_EXECUTOR.set(ex.clone());
 
     let base_features = base_features(ProtectionType::Unprotected);
     let block = BlockBackend::new(
-        disk_image,
+        async_file,
         base_features,
         read_only,
         sparse,
