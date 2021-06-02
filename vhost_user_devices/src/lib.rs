@@ -486,9 +486,11 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
                 .backend
                 .start_queue(index as usize, queue, mem, call_evt, kick_evt)
             {
+                println!("Failed to start queue {}: {}", index, e);
                 error!("Failed to start queue {}: {}", index, e);
                 return Err(VhostError::SlaveInternalError);
             }
+            println!("queue started");
         }
         Ok(())
     }

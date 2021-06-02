@@ -184,6 +184,7 @@ impl VhostUserBackend for BlockBackend {
     ) -> anyhow::Result<()> {
         println!("start queue: {}", idx);
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
+            println!("Starting new queue handler without stopping old handler");
             warn!("Starting new queue handler without stopping old handler");
             handle.abort();
         }
@@ -235,14 +236,17 @@ async fn handle_queue(
     flush_timer: Rc<RefCell<TimerAsync>>,
     flush_timer_armed: Rc<RefCell<bool>>,
 ) {
+    println!("handle_queue start");
     loop {
         if let Err(e) = evt.next_val().await {
+            println!("Failed to read the next queue event: {}", e);
             error!("Failed to read the next queue event: {}", e);
             continue;
         }
         // Safe because the executor is initialized in main() below.
         let ex = BLOCK_EXECUTOR.get().expect("Executor not initialized");
         while let Some(descriptor_chain) = queue.borrow_mut().pop(&mem) {
+            println!("handle_queue loop spawn one");
             ex.spawn_local(process_one_request_task(
                 Rc::clone(&queue),
                 descriptor_chain,
