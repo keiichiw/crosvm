@@ -243,8 +243,10 @@ async fn handle_queue(
             error!("Failed to read the next queue event: {}", e);
             continue;
         }
+        println!("got queue event");
         // Safe because the executor is initialized in main() below.
         let ex = BLOCK_EXECUTOR.get().expect("Executor not initialized");
+        println!("got queue event and executor");
         while let Some(descriptor_chain) = queue.borrow_mut().pop(&mem) {
             println!("handle_queue loop spawn one");
             ex.spawn_local(process_one_request_task(
