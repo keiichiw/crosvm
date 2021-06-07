@@ -391,7 +391,7 @@ async fn flush_disk(
 // a resizing command.
 fn run_worker(
     ex: Executor,
-    interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
+    interrupts: Vec<Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>>,
     queues: Vec<Queue>,
     mem: GuestMemory,
     disk_state: &Rc<AsyncMutex<DiskState>>,
@@ -402,11 +402,6 @@ fn run_worker(
     // One flush timer per disk.
     let timer = Timer::new().expect("Failed to create a timer");
     let flush_timer_armed = Rc::new(RefCell::new(false));
-
-    let interrupts: Vec<Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>> = interrupts
-        .into_iter()
-        .map(|i| Rc::new(RefCell::new(i)))
-        .collect();
 
     let (resample, control) = if let Some(int) = interrupts.get(0) {
         // Process any requests to resample the irq value.
@@ -431,6 +426,10 @@ fn run_worker(
         )
         .expect("Failed to create an async timer"),
     ));
+
+    assert_eq!(queues.len(), queue_evts.len());
+    assert_eq!(queues.len(), interrupts.len());
+
     let queue_handlers =
         queues
             .into_iter()
@@ -772,16 +771,6 @@ impl VirtioDevice for BlockAsync {
         queues: Vec<Queue>,
         queue_evts: Vec<Event>,
     ) {
-        self.activate_vhost(mem, vec![Box::new(interrupt)], queues, queue_evts)
-    }
-
-    fn activate_vhost(
-        &mut self,
-        mem: GuestMemory,
-        interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
-        queues: Vec<Queue>,
-        queue_evts: Vec<Event>,
-    ) {
         let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(e) => {
@@ -802,6 +791,15 @@ impl VirtioDevice for BlockAsync {
                     .name("virtio_blk".to_string())
                     .spawn(move || {
                         let ex = Executor::new().expect("Failed to create an executor");
+
+                        let interrupt: Rc<RefCell<Box<dyn SignalableInterrupt + Send>>> =
+                            Rc::new(RefCell::new(Box::new(interrupt)));
+                        let mut interrupts: Vec<Rc<RefCell<Box<dyn SignalableInterrupt + Send>>>> =
+                            vec![];
+                        for _ in 0..queues.len() {
+                            interrupts.push(interrupt.clone());
+                        }
+
                         let async_control = control_tube
                             .map(|c| c.into_async_tube(&ex).expect("failed to create async tube"));
                         let async_image = match disk_image.to_async_disk(&ex) {

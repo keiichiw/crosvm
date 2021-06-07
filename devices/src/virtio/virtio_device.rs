@@ -65,15 +65,6 @@ pub trait VirtioDevice: Send {
         queue_evts: Vec<Event>,
     );
 
-    fn activate_vhost(
-        &mut self,
-        _mem: GuestMemory,
-        _interrupts: Vec<Box<dyn SignalableInterrupt + Send>>,
-        _queues: Vec<Queue>,
-        _queue_evts: Vec<Event>,
-    ) {
-    }
-
     /// Optionally deactivates this device. If the reset method is
     /// not able to reset the virtio device, or the virtio device model doesn't
     /// implement the reset method, a false value is returned to indicate
